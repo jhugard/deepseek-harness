@@ -346,6 +346,7 @@ function contextOf(
     key: `${definition.kind}:fixture`,
     kind: definition.kind,
     id: 'fixture',
+    occurrence: 0,
     matches,
     start,
     state,
