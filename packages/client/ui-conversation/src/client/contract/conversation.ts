@@ -239,6 +239,25 @@ export interface ConversationNodeDefinition<State = unknown> {
    */
   publication?(match: ConversationMatch): ConversationPublication
   /**
+   * Declare that a Match settles the occurrence it updates, so that a later
+   * Match for the same logical id opens a fresh occurrence instead of
+   * re-attaching to the closed one. Return true when the Match is terminal
+   * for the current occurrence (e.g. a tool result closes the call that
+   * started it). Default: false. Consulted only for update-role Matches and
+   * only when the Definition's logical id is reused across occurrences.
+   * @param match - accepted Match.
+   */
+  settle?(match: ConversationMatch): boolean
+  /**
+   * Return a per-occurrence identity for a Match, or null to keep it. A Match
+   * whose identity was already seen for the same logical id is skipped
+   * entirely (no start or update, publication 'none'), which drops
+   * re-emissions of an already-recorded event (e.g. a prune pass re-sending a
+   * tool result whose message.id was already applied). Default: null.
+   * @param match - accepted Match.
+   */
+  dedupe?(match: ConversationMatch): string | null
+  /**
    * Publish this Definition's read-only business value for one Location phase.
    * The Engine evaluates every Definition first for Step and then for Turn,
    * owns replacement/removal, and rejects another Context trying to publish

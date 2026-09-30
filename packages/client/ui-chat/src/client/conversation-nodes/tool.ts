@@ -327,6 +327,8 @@ export const toolDefinition: ConversationNodeDefinition<ToolState> = {
     return updateDispatch(context.state, match)
   },
   publication: match => match.event.type === 'assistant/live-chunk' ? 'animation-frame' : 'immediate',
+  settle: match => match.event.type === 'tool/result',
+  dedupe: match => match.event.type === 'tool/result' ? String(match.event.data.message.id) : null,
   buildViewNode: (context) => {
     const current = context.current.get('chat') as ChatNode<'tool-call'> | null | undefined
     const state = context.state ?? fallbackState(context)

@@ -261,6 +261,8 @@ const trajectoryToolDefinition: ConversationNodeDefinition<ToolState> = {
     calls.set(context.state.rootId, result)
     return { ...context.state, calls }
   },
+  settle: match => match.event.type === 'tool/result',
+  dedupe: match => match.event.type === 'tool/result' ? String(match.event.data.message.id) : null,
   buildViewNode: (context) => {
     const state = context.state ?? fallbackState(context)
     if (state === undefined) return null
