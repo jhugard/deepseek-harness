@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { SessionFormatUnsupportedMigrationError } from '@deepseek-ai/dsh-session-format'
+import type { SessionFormatArtifact, SessionFormatEvent } from '@deepseek-ai/dsh-session-format'
 import {
   assertReleasedArtifactRelationships,
 } from '../src/index.ts'
@@ -278,6 +279,87 @@ describe('released v1 whole-artifact relationships', () => {
       ...synthetic,
       data: { ...synthetic.data, error: { name: 'Other', code: 'TOOL_NOT_STARTED' } },
     }])).toThrow(/TOOL_NOT_STARTED repair/)
+  })
+
+  it('admits duplicate advertised tool calls under allowDuplicateAdvertisedToolCall', () => {
+    const flag = { allowDuplicateAdvertisedToolCall: true } as const
+    const turnAndStep: SessionFormatEvent[] = [
+      { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
+      { type: 'step/start', seq: 1, time: 2, data: { turn: 1, step: 1 } },
+    ]
+    const ad = (seq: number): SessionFormatEvent => ({
+      type: 'assistant/message', seq, time: seq + 1, surfaceOp: 'append',
+      data: {
+        turn: 1, step: 1,
+        message: {
+          id: 'assistant-tools', role: 'assistant',
+          content: [{ type: 'tool-call', id: 'a', name: 'read', arguments: '{}' }],
+          source: { kind: 'model', provider: 'mock', model: 'mock' },
+        },
+      },
+    })
+    const tc = (seq: number): SessionFormatEvent => ({
+      type: 'tool/call', seq, time: seq + 1,
+      data: { turn: 1, step: 1, callId: 'a', name: 'read', arguments: '{}' },
+    })
+    const tr = (seq: number): SessionFormatEvent => ({
+      type: 'tool/result', seq, time: seq + 1, surfaceOp: 'append',
+      data: {
+        turn: 1, step: 1,
+        message: {
+          id: 'result', role: 'user',
+          content: [{ type: 'tool-result', toolCallId: 'a', content: [], isError: false }],
+          source: { kind: 'tool', callId: 'a' },
+        },
+      },
+    })
+    const artifact = (events: readonly SessionFormatEvent[]): SessionFormatArtifact => ({
+      header: { ...header, isSeeded: false },
+      inheritedEventCount: 0,
+      events,
+    })
+
+    // Two occurrences: each needs its own tool/call and tool/result, resolved in stream order.
+    expect(() => assertReleasedArtifactRelationships(
+      artifact([...turnAndStep, ad(2), tc(3), tr(4), ad(5), tc(6), tr(7)]), flag,
+    )).not.toThrow()
+
+    // Three occurrences.
+    expect(() => assertReleasedArtifactRelationships(
+      artifact([
+        ...turnAndStep, ad(2), tc(3), tr(4), ad(5), tc(6), tr(7), ad(8), tc(9), tr(10),
+      ]), flag,
+    )).not.toThrow()
+
+    // Without the flag, a second advertisement of the same id while one is still open is rejected.
+    expect(() => assertReleasedArtifactRelationships(
+      artifact([...turnAndStep, ad(2), ad(3)]), {},
+    )).toThrow(/repeats advertised tool call/)
+
+    // Mismatched arguments on the second occurrence under the flag.
+    const mismatched: SessionFormatEvent = {
+      type: 'tool/call', seq: 6, time: 7,
+      data: { turn: 1, step: 1, callId: 'a', name: 'read', arguments: '{"x":1}' },
+    }
+    expect(() => assertReleasedArtifactRelationships(
+      artifact([...turnAndStep, ad(2), tc(3), tr(4), ad(5), mismatched]), flag,
+    )).toThrow(/does not match one advertised tool call/)
+
+    // A result for an id with no advertised lifecycle at all.
+    const dangling: SessionFormatEvent = {
+      type: 'tool/result', seq: 5, time: 6, surfaceOp: 'append',
+      data: {
+        turn: 1, step: 1,
+        message: {
+          id: 'result', role: 'user',
+          content: [{ type: 'tool-result', toolCallId: 'a', content: [], isError: false }],
+          source: { kind: 'tool', callId: 'z' },
+        },
+      },
+    }
+    expect(() => assertReleasedArtifactRelationships(
+      artifact([...turnAndStep, dangling]), flag,
+    )).toThrow(/no advertised tool lifecycle/)
   })
 
   it('enforces retry mode, failure, route, and policy-chain relationships', () => {

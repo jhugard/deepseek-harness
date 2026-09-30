@@ -58,7 +58,11 @@ class Relationships {
   surface: number[] = []
   protectedHead: number | undefined
   compaction: Compaction | undefined
-  readonly tools = new Map<string, ToolState>()
+  // Each advertised id maps to its occurrences. Local patch: local OpenAI-compatible servers
+  // re-emit one tool call under the same composed id within one step; each occurrence needs its
+  // own tool/call and tool/result, matched in stream order (first unstarted, then first
+  // started). See pi-ai openai-completions normalizeToolCallId for the id composition.
+  readonly tools = new Map<string, ToolState[]>()
   readonly dispatches = new Map<string, { data: SessionFormatJsonObject; settled: boolean }>()
   readonly retries: SessionFormatJsonObject[] = []
   readonly startedRetries = new Set<string>()
@@ -157,17 +161,24 @@ class Relationships {
         const block = record(value, 'assistant content block')
         if (block['type'] !== 'tool-call') continue
         const id = text(block['id'], 'tool call id')
-        if (this.tools.has(id)) throw new SessionFormatError(`assistant/message repeats advertised tool call ${id}`)
-        this.tools.set(id, { name: block['name'], arguments: block['arguments'], started: false })
+        const state: ToolState = { name: block['name'], arguments: block['arguments'], started: false }
+        const existing = this.tools.get(id)
+        if (existing === undefined) this.tools.set(id, [state])
+        else existing.push(state)
       }
       return
     }
     const message = event.type === 'tool/result' ? record(data['message'], 'tool result message') : undefined
     const id = text(message === undefined ? data['callId'] : message['toolCallId'], 'tool call id')
-    const pending = this.tools.get(id)
-    if (pending === undefined) throw new SessionFormatError(`${event.type} ${id} has no advertised tool lifecycle`)
+    const group = this.tools.get(id)
+    const pending = message === undefined
+      ? group?.find(candidate => !candidate.started)
+      : group?.find(candidate => candidate.started) ?? group?.find(candidate => !candidate.started)
+    if (pending === undefined || group === undefined) {
+      throw new SessionFormatError(`${event.type} ${id} has no advertised tool lifecycle`)
+    }
     if (message === undefined) {
-      if (pending.started || pending.name !== data['name'] || pending.arguments !== data['arguments']) {
+      if (pending.name !== data['name'] || pending.arguments !== data['arguments']) {
         throw new SessionFormatError(`tool/call ${id} does not match one advertised tool call`)
       }
       pending.started = true
@@ -175,7 +186,9 @@ class Relationships {
       if (!pending.started && !notStartedRepair(event, data, message, id)) {
         throw new SessionFormatError(`tool/result ${id} is not the exact TOOL_NOT_STARTED repair`)
       }
-      this.tools.delete(id)
+      const remaining = group.filter(candidate => candidate !== pending)
+      if (remaining.length === 0) this.tools.delete(id)
+      else this.tools.set(id, remaining)
     }
   }
 
