@@ -58,6 +58,12 @@ describe('mandatory V4 lifecycle restoration', () => {
     for (let length = 0; length < rows.length; length += 1) expect(() => reopen(rows.slice(0, length))).not.toThrow()
   })
 
+  it('admits duplicate advertised tool calls matched in stream order', () => {
+    const resolved = [...begin(), assistant([call, call]), toolCall(), result(), toolCall(), result(), ...end()]
+    expect(reopen(resolved).messages.map(message => message.role)).toEqual(['assistant', 'tool', 'tool'])
+    for (let length = 0; length < resolved.length; length += 1) expect(() => reopen(resolved.slice(0, length))).not.toThrow()
+  })
+
   it.each([
     ['turn order', [row('turn/start', { turn: 2 })]],
     ['duplicate turn', [row('turn/start', { turn: 1 }), row('turn/start', { turn: 1 })]],
@@ -70,7 +76,6 @@ describe('mandatory V4 lifecycle restoration', () => {
     ['assistant attempt outside step', [row('assistant/attempt', { ...step, stream: [] })]],
     ['tool without advertisement', [...begin(), toolCall()]],
     ['result without advertisement', [...begin(), result()]],
-    ['repeated advertisement', [...begin(), assistant([call, call])]],
     ['changed tool name', [...begin(), assistant(), row('tool/call', { ...step, callId: 'call', name: 'other', arguments: '{}' })]],
     ['changed tool arguments', [...begin(), assistant(), row('tool/call', { ...step, callId: 'call', name: 'read', arguments: '[]' })]],
     ['repeated start', [...begin(), assistant(), toolCall(), toolCall()]],

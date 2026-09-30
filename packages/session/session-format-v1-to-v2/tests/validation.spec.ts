@@ -441,4 +441,27 @@ describe('released v2 restoration seam', () => {
       new Set(RELEASED_V2_EVENT_TYPES),
     )).toThrow(/unknown event type/)
   })
+
+  it('restores released artifacts with duplicate advertised tool calls', () => {
+    const duplicate = artifact([
+      event('turn/start', 0, { turn: 1 }),
+      event('step/start', 1, { turn: 1, step: 1 }),
+      event('assistant/message', 2, assistantData({
+        content: [
+          { type: 'tool-call', id: 'call', name: 'read', arguments: '{}' },
+          { type: 'tool-call', id: 'call', name: 'read', arguments: '{}' },
+        ],
+        stream: [],
+        usage: null,
+        replayState: null,
+      }), { surfaceOp: 'append' }),
+      event('tool/call', 3, { turn: 1, step: 1, callId: 'call', name: 'read', arguments: '{}' }),
+      event('tool/result', 4, toolResultData(false), { surfaceOp: 'append' }),
+      event('tool/call', 5, { turn: 1, step: 1, callId: 'call', name: 'read', arguments: '{}' }),
+      event('tool/result', 6, toolResultData(false), { surfaceOp: 'append' }),
+      event('step/end', 7, { turn: 1, step: 1 }),
+      event('turn/end', 8, { turn: 1, reason: { kind: 'completed' } }),
+    ])
+    expect(restoreReleasedV2Artifact(duplicate, new Set(RELEASED_V2_EVENT_TYPES))).toBe(duplicate)
+  })
 })
