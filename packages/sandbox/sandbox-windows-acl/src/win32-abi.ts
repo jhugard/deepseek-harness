@@ -38,8 +38,26 @@ export const WRITE_RESTRICTED = 0x8
 export const WinWorldSid = 1
 /** TOKEN_INFORMATION_CLASS value for token groups. */
 export const TokenGroups = 2
+/** TOKEN_INFORMATION_CLASS value for the token's privilege set. */
+export const TokenPrivileges = 3
 /** TOKEN_INFORMATION_CLASS value for the token default DACL. */
 export const TokenDefaultDacl = 6
+/** Token right required to enable or disable the token's privileges. */
+export const TOKEN_ADJUST_PRIVILEGES = 0x0020
+/** LUID_AND_ATTRIBUTES.Attributes value marking a privilege enabled. */
+export const SE_PRIVILEGE_ENABLED = 0x00000002
+/** x64 LUID_AND_ATTRIBUTES byte size (LUID + Attributes). */
+export const LUID_AND_ATTRIBUTES_SIZE = 16
+/**
+ * x64 byte size of a TOKEN_PRIVILEGES holding exactly one privilege:
+ * the 4-byte PrivilegeCount header plus one 12-byte LUID_AND_ATTRIBUTES
+ * entry (Luid + Attributes; the entry carries no trailing padding).
+ * Pass a buffer of this shape — never a bare LUID_AND_ATTRIBUTES — to
+ * AdjustTokenPrivileges, which reads the header's count first.
+ */
+export const TOKEN_PRIVILEGES_SINGLE_SIZE = 4 + 12
+/** Privilege name that authorizes setting integrity labels (S-1-16-x ACEs). */
+export const SE_RELABEL_NAME = 'SeRelabelPrivilege'
 /** SECURITY_INFORMATION flag selecting the DACL. */
 export const DACL_SECURITY_INFORMATION = 0x00000004
 /** SECURITY_INFORMATION flag selecting the mandatory integrity label. */
@@ -93,6 +111,10 @@ export const MAX_PATH = 260
 export const ERROR_SUCCESS = 0
 /** Win32 error reported when an immediate byte-range lock cannot be obtained. */
 export const ERROR_LOCK_VIOLATION = 33
+/** Win32 error reported when a token privilege could not be enabled (the privilege exists but is not held with the enabling bit). */
+export const ERROR_NOT_ALL_ASSIGNED = 1300
+/** Win32 error reported when the named privilege is not present in the token at all. */
+export const ERROR_NO_SUCH_PRIVILEGE = 1301
 /** Generic read access bit. */
 export const GENERIC_READ = 0x80000000
 /** Generic write access bit. */

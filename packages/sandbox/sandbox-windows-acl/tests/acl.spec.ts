@@ -345,11 +345,11 @@ describe.skipIf(!isWin32)('ACL editing', () => {
     const apply = vi.spyOn(api, 'setNamedSecurityInfoW')
     try {
       grantWrite(api, dir, capabilitySid, lowSid, world)
-      expect(apply).toHaveBeenCalledTimes(1)
+      expect(apply).toHaveBeenCalledTimes(2) // DACL step + LABEL step
       // The exact ACE, deny, and label now stand (the per-session grant
       // surviving from a previous server lifetime): the second grant is a read only.
       grantWrite(api, dir, capabilitySid, lowSid, world)
-      expect(apply).toHaveBeenCalledTimes(1)
+      expect(apply).toHaveBeenCalledTimes(2) // the skip adds no apply
       const aces = readDirectAces(api, dir)
       expect(aces.filter(ace => ace.sid === 'S-1-4-4242-2')).toHaveLength(1)
       expect(aces.filter(ace => ace.sid === 'S-1-1-0')).toHaveLength(1)

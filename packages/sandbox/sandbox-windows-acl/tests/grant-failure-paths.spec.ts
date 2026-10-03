@@ -58,6 +58,25 @@ function grantThenFailApi(): { api: Win32Bindings; failReads: () => void } {
       return 0
     }),
     setNamedSecurityInfoW: vi.fn(() => 0),
+    openProcess: vi.fn(() => 13n as NativePtr),
+    openProcessToken: vi.fn((_process: unknown, _access: unknown, slot: NativePtr) => {
+      koffi.encode(slot, PVOID, 14n)
+      return 1
+    }),
+    getTokenInformation: vi.fn((_token: unknown, _cls: number, info: Buffer | null, _length: number, needed: NativePtr) => {
+      if (info === null) {
+        koffi.encode(needed, 'uint32', 8)
+        return 0 // the TokenPrivileges size probe is expected to "fail"
+      }
+      info.writeUInt32LE(1, 0) // PrivilegeCount
+      return 1
+    }),
+    lookupPrivilegeValueW: vi.fn((_system: unknown, _name: unknown, luid: Buffer) => {
+      luid.writeUInt32LE(0x00010000, 0) // Luid.Low — the value is irrelevant to the stub
+      luid.writeUInt32LE(0, 4) // Luid.High
+      return 1
+    }),
+    adjustTokenPrivileges: vi.fn(() => 1),
     localFree: vi.fn(() => 0n as NativePtr),
     getLastError: vi.fn(() => 2),
     formatMessageW: vi.fn(() => 0),
