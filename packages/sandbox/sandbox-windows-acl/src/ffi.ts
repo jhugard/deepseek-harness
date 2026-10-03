@@ -48,6 +48,15 @@ export interface Win32Bindings extends Win32ProcessBindings {
   copySid(length: number, destination: NativePtr, source: NativePtr): number
   getTokenInformation(token: NativePtr, cls: number, info: Buffer | null, length: number, needed: NativePtr): number
   setTokenInformation(token: NativePtr, cls: number, info: Buffer, length: number): number
+  lookupPrivilegeValueW(systemName: null, name: string, luid: Buffer): number
+  adjustTokenPrivileges(
+    token: NativePtr,
+    disableAll: number,
+    newState: Buffer,
+    length: number,
+    previous: null,
+    returnLength: NativePtr,
+  ): number
   createRestrictedToken(
     existing: NativePtr,
     flags: number,
@@ -250,6 +259,10 @@ function bindings(): Win32Bindings {
       PVOID, 'int', PVOID, 'uint32', koffi.pointer('uint32'),
     ]),
     setTokenInformation: bind(advapi32, 'SetTokenInformation', 'int', [PVOID, 'int', PVOID, 'uint32']),
+    lookupPrivilegeValueW: bind(advapi32, 'LookupPrivilegeValueW', 'int', [PVOID, 'str16', PVOID]),
+    adjustTokenPrivileges: bind(advapi32, 'AdjustTokenPrivileges', 'int', [
+      PVOID, 'int', PVOID, 'uint32', PVOID, koffi.pointer('uint32'),
+    ]),
     createRestrictedToken: bind(advapi32, 'CreateRestrictedToken', 'int', [
       PVOID, 'uint32', 'uint32', PVOID, 'uint32', PVOID, 'uint32', PVOID, PPVOID,
     ]),

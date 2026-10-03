@@ -1,0 +1,25 @@
+# Bilingual-pair consistency record for 2026-10-03-windows-acl-grant-dac-label-split.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/bug-fix/2026-10-03-windows-acl-grant-dac-label-split.md
+/agent-note-the-windows-sandbox-acl-grant-issues-the-dacl-and-the-integrity-label-in-separate-calls:
+  en: 10a877dee2b1c676
+  zh: bcd02082e4d36030
+/agent-note-the-windows-sandbox-acl-grant-issues-the-dacl-and-the-integrity-label-in-separate-calls/problem:
+  en: 8ca004f46e3f113a
+  zh: 42855417a0071e9c
+/agent-note-the-windows-sandbox-acl-grant-issues-the-dacl-and-the-integrity-label-in-separate-calls/decision:
+  en: e1a1e90e387eed33
+  zh: 3e4e8c31aad6010d
+/agent-note-the-windows-sandbox-acl-grant-issues-the-dacl-and-the-integrity-label-in-separate-calls/alternatives-considered:
+  en: f8b061149a58bfe5
+  zh: 65cb4f8a1189632e
+/agent-note-the-windows-sandbox-acl-grant-issues-the-dacl-and-the-integrity-label-in-separate-calls/consequences:
+  en: aefb4bb507027635
+  zh: ed8eca9eab94dbbb
+/agent-note-the-windows-sandbox-acl-grant-issues-the-dacl-and-the-integrity-label-in-separate-calls/upstream-status:
+  en: a69027b5d870822a
+  zh: 1f84e6d8ba962143
+/agent-note-the-windows-sandbox-acl-grant-issues-the-dacl-and-the-integrity-label-in-separate-calls/testing:
+  en: fbdae9cbdc09b77b
+  zh: 1a6e03ca926e97bf
