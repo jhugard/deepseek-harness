@@ -1,0 +1,22 @@
+# Bilingual-pair consistency record for 2026-09-29-duplicate-advertised-tool-call-ids.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/bug-fix/2026-09-29-duplicate-advertised-tool-call-ids.md
+/agent-note-a-repeated-advertised-tool-call-id-is-a-separate-occurrence:
+  en: 1080de5eb4b82ad0
+  zh: 8dec99da868410b7
+/agent-note-a-repeated-advertised-tool-call-id-is-a-separate-occurrence/problem:
+  en: f7d8b4b08c1dfad9
+  zh: a55a509651a2572c
+/agent-note-a-repeated-advertised-tool-call-id-is-a-separate-occurrence/decision:
+  en: cfa07e96a854d0f8
+  zh: c2e347f69404ec25
+/agent-note-a-repeated-advertised-tool-call-id-is-a-separate-occurrence/alternatives-considered:
+  en: a386e60b6c795136
+  zh: b48e8b5af6f10f67
+/agent-note-a-repeated-advertised-tool-call-id-is-a-separate-occurrence/consequences:
+  en: 0320095c55116141
+  zh: 9031ec6dd57176b1
+/agent-note-a-repeated-advertised-tool-call-id-is-a-separate-occurrence/testing:
+  en: 28544b58e2e62280
+  zh: 4e3f43610141cb60
