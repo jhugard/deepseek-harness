@@ -5,14 +5,22 @@
  * failure is reported with the API name, the exact Win32 code, the formatted
  * system text, and the affected path.
  *
- * Each grant applies three edits in ONE SetNamedSecurityInfoW call: the
- * capability-SID allow ACE, a Deny ACE that removes the ambient
- * `FILE_DELETE_CHILD` right from the world SID, and a Low no-write-up
- * mandatory label ({@link buildLowLabelAcl}). The deny is what keeps one
- * granted root out of another's reach: Windows also authorizes a delete from
- * the parent directory's `FILE_DELETE_CHILD` right, which the token's
- * write-restricted intersection does not reach, and every granted root carries
- * the Low label that clears the integrity check.
+ * Each grant applies three edits in TWO SetNamedSecurityInfoW calls: the
+ * capability-SID allow ACE plus the ambient-delete Deny ACE go out first in a
+ * DACL-only call ({@link abi.DACL_SECURITY_INFORMATION}); the Low no-write-up
+ * mandatory label ({@link buildLowLabelAcl}) goes out second in a
+ * LABEL-only call ({@link abi.LABEL_SECURITY_INFORMATION}) after the
+ * SeRelabelPrivilege enable ({@link ensureRelabelPrivilege}). The kernel
+ * evaluates every requested information class up front, so a combined
+ * DACL|LABEL call by a token without the privilege fails wholesale with
+ * ERROR_ACCESS_DENIED — losing even the DACL grant and crashing the
+ * workspace binding. Decoupled, the DACL step succeeds under the owner's
+ * implicit WRITE_DAC and a label failure degrades to a diagnostic instead of
+ * a throw. The deny is what keeps one granted root out of another's reach:
+ * Windows also authorizes a delete from the parent directory's
+ * `FILE_DELETE_CHILD` right, which the token's write-restricted intersection
+ * does not reach, and every granted root carries the Low label that clears
+ * the integrity check.
  *
  * Concurrency: grants are read-merge-write against the directory's CURRENT
  * DACL, and the whole get-merge-set sequence runs under a per-path exclusive
@@ -25,7 +33,9 @@ import { createHash } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
-import { allocOverlapped, allocPtrSlot, decodePtr, decodeUint8At, decodeUint16At, decodeUint32At, getTempPath, isInvalidHandle, isNullPtr, ptrAddress, sameSidAt, throwLastError, throwWin32 } from './ffi.ts'
+import { Win32Error } from '@deepseek-ai/dsh-win32-process'
+
+import { allocOverlapped, allocPtrSlot, allocUint32, decodePtr, decodeUint8At, decodeUint16At, decodeUint32, decodeUint32At, getTempPath, isInvalidHandle, isNullPtr, ptrAddress, sameSidAt, throwLastError, throwWin32 } from './ffi.ts'
 import type { NativePtr, Win32Bindings } from './ffi.ts'
 import * as abi from './win32-abi.ts'
 
@@ -213,16 +223,22 @@ type LabelEdit = { kind: 'apply'; acl: NativePtr } | { kind: 'clear' } | { kind:
 /**
  * Shared tail of grantWrite and revokeWrite: merge `entries` into `oldAcl`
  * (null = no explicit DACL yet; SetEntriesInAclW builds one from scratch),
- * free the descriptor before applying the merged ACL, apply the merged DACL
- * together with the label edit in one SetNamedSecurityInfoW call, then free
- * every ACL this call owns — checking each call and reporting with the
- * caller's label. The entry count derives from the buffer, so a grant can
- * carry its capability ACE and its ambient-delete deny in one merge.
+ * free the descriptor, then apply the edits in two SetNamedSecurityInfoW
+ * calls — the merged DACL ALONE (owner-implicit WRITE_DAC suffices), then the
+ * label edit ALONE after the SeRelabelPrivilege enable ({@link
+ * ensureRelabelPrivilege}) — freeing every ACL this operation owns and
+ * reporting each failure with the caller's label and the step's context
+ * (`DACL step` / `LABEL step`). A combined DACL|LABEL call would fail
+ * wholesale with ERROR_ACCESS_DENIED whenever the token lacks the privilege,
+ * losing even the DACL grant; the split keeps the grant live when the label
+ * cannot be written (the label step then degrades to a diagnostic instead of
+ * a throw). The entry count derives from the buffer, so a grant can carry its
+ * capability ACE and its ambient-delete deny in one merge.
  * @param api - the binding table.
  * @param path - the directory the DACL and label edits apply to.
  * @param entries - packed EXPLICIT_ACCESS_W records to merge (grant, deny, or revoke).
  * @param oldAcl - the current explicit DACL (from {@link readCurrentSecurity}).
- * @param labelEdit - the label change to apply alongside the DACL.
+ * @param labelEdit - the label change to apply after the DACL step.
  * @param descriptor - the descriptor allocation owning `oldAcl`.
  * @param label - the caller's name for error details.
  */
@@ -252,17 +268,241 @@ function mergeAndApply(
   // The descriptor block (oldAcl included) is dead after the merge — free it
   // before applying, exactly like the POC.
   const freedDescriptor = descriptor !== null ? api.localFree(descriptor) : null
-  const applyResult = api.setNamedSecurityInfoW(
-    path, abi.SE_FILE_OBJECT,
-    labelEdit.kind === 'keep' ? abi.DACL_SECURITY_INFORMATION : abi.DACL_SECURITY_INFORMATION | abi.LABEL_SECURITY_INFORMATION,
-    null, null, newAcl, labelEdit.kind === 'apply' ? labelEdit.acl : null,
+
+  // Step A: the DACL edit goes out ALONE. A combined DACL|LABEL call makes
+  // the kernel require the SeRelabelPrivilege for the label part BEFORE any
+  // part of the call is applied — a standard user token without the privilege
+  // fails the whole call with ERROR_ACCESS_DENIED and loses even the DACL
+  // grant, which crashes the workspace binding. DACL-only needs nothing but
+  // the owner-implicit WRITE_DAC, so it succeeds on its own.
+  const daclResult = api.setNamedSecurityInfoW(
+    path, abi.SE_FILE_OBJECT, abi.DACL_SECURITY_INFORMATION, null, null, newAcl, null,
   )
   const freedNew = api.localFree(newAcl)
-  const freedLabel = labelEdit.kind === 'apply' ? api.localFree(labelEdit.acl) : null
-  if (applyResult !== abi.ERROR_SUCCESS) throwWin32(api, 'SetNamedSecurityInfoW', applyResult, `${label}(${path})`)
-  if (freedDescriptor !== null && !isNullPtr(freedDescriptor)) throwLastError(api, 'LocalFree', `${label}(${path}) descriptor`)
+  if (daclResult !== abi.ERROR_SUCCESS) {
+    // The DACL step failed: the label ACL is still owned and must not leak.
+    // Free it (checked) and report with the DACL context — like the single-call
+    // path, the apply failure throws before the free-result checks run.
+    if (labelEdit.kind === 'apply') {
+      const freedLabel = api.localFree(labelEdit.acl)
+      if (!isNullPtr(freedLabel)) throwLastError(api, 'LocalFree', `${label}(${path}) label ACL`)
+    }
+    throwWin32(api, 'SetNamedSecurityInfoW', daclResult, `${label}(${path}) DACL step`)
+  }
   if (!isNullPtr(freedNew)) throwLastError(api, 'LocalFree', `${label}(${path}) new ACL`)
-  if (freedLabel !== null && !isNullPtr(freedLabel)) throwLastError(api, 'LocalFree', `${label}(${path}) label ACL`)
+
+  // The DACL is on disk; the label edits below can no longer roll it back.
+  // `keep` leaves the standing label untouched.
+  if (labelEdit.kind === 'keep') {
+    if (freedDescriptor !== null && !isNullPtr(freedDescriptor)) throwLastError(api, 'LocalFree', `${label}(${path}) descriptor`)
+    return
+  }
+
+  // Step B: enable the SeRelabelPrivilege the SACL write requires. Failing
+  // here is a label-degrade, not a grant failure: the DACL grant stands, so
+  // the workspace binding stays live and the child runs without the
+  // integrity protection.
+  const privilege = ensureRelabelPrivilege(api, `${label}(${path}) label step`)
+  if (privilege.enabled === false) {
+    freeLabelIfOwned(api, labelEdit, `${label}(${path})`)
+    if (freedDescriptor !== null && !isNullPtr(freedDescriptor)) throwLastError(api, 'LocalFree', `${label}(${path}) descriptor`)
+    reportLabelDegrade(path, label, privilege.reason)
+    return
+  }
+
+  // Step C: the LABEL edit goes out ALONE — `apply` sets the Low no-write-up
+  // ACE, `clear` replaces the SACL with a NULL pointer (removes every label
+  // ACE).
+  const labelResult = api.setNamedSecurityInfoW(
+    path, abi.SE_FILE_OBJECT, abi.LABEL_SECURITY_INFORMATION, null, null, null,
+    labelEdit.kind === 'apply' ? labelEdit.acl : null,
+  )
+  freeLabelIfOwned(api, labelEdit, `${label}(${path})`)
+  if (labelResult !== abi.ERROR_SUCCESS) {
+    // The privilege was held and enabled yet the write still failed — report
+    // the exact code plus the diagnostic trail and let the caller's
+    // fail-closed semantics decide the outcome.
+    reportLabelFailure(api, path, label, labelResult, privilege)
+  }
+  if (freedDescriptor !== null && !isNullPtr(freedDescriptor)) throwLastError(api, 'LocalFree', `${label}(${path}) descriptor`)
+}
+
+/** The privilege-enable outcome one label step needs. */
+interface RelabelPrivilege {
+  /** True when SeRelabelPrivilege was enabled in the current token. */
+  enabled: boolean
+  /** The human-readable reason when it was not (1300/1301 with system text, or the failing API). */
+  reason: string
+}
+
+/** FormatMessageW buffer size for the diagnostic text (characters). */
+const PRIVILEGE_MESSAGE_CHARS = 1024
+
+/** Read one Win32 message string (the formatted system text for `code`). */
+function privilegeMessage(api: Win32Bindings, code: number): string {
+  const buffer = Buffer.alloc((PRIVILEGE_MESSAGE_CHARS + 1) * 2)
+  const written = api.formatMessageW(0, null, code, 0, buffer, buffer.length / 2, null)
+  if (written === 0) return ''
+  return buffer.subarray(0, written * 2).toString('utf16le').trim()
+}
+
+/**
+ * Enable `SE_RELABEL_NAME` (SeRelabelPrivilege) in the CURRENT process token
+ * for the SACL writes that follow. Opens a fresh token handle with
+ * TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES (the sandbox token opened by
+ * {@link openCurrentProcessToken} carries neither right), reads the privilege
+ * set, and enables the single privilege through AdjustTokenPrivileges.
+ *
+ * Non-throwing by contract: every failure returns `{ enabled: false }` with
+ * the reason, because the caller has already applied the DACL grant and must
+ * degrade the label — not fail the workspace binding. The token and process
+ * handles are always closed, including on the failure paths.
+ * @param api - the binding table.
+ * @param context - the caller's name for error details.
+ * @returns the enable outcome (never throws).
+ */
+export function ensureRelabelPrivilege(api: Win32Bindings, context: string): RelabelPrivilege {
+  let processHandle: NativePtr | null = null
+  let token: NativePtr | null = null
+  try {
+    processHandle = api.openProcess(abi.PROCESS_QUERY_INFORMATION, 0, process.pid)
+    if (isNullPtr(processHandle)) {
+      return { enabled: false, reason: `OpenProcess failed (Win32 ${api.getLastError()}) for pid ${process.pid}; the privilege cannot be enabled and the integrity label is skipped` }
+    }
+    const tokenSlot = allocPtrSlot()
+    const opened = api.openProcessToken(
+      processHandle, abi.TOKEN_QUERY | abi.TOKEN_ADJUST_PRIVILEGES, tokenSlot,
+    )
+    if (opened === 0) {
+      const code = api.getLastError()
+      return { enabled: false, reason: `OpenProcessToken failed (Win32 ${code}: ${privilegeMessage(api, code)}) for pid ${process.pid}; the privilege cannot be enabled and the integrity label is skipped` }
+    }
+    token = decodePtr(tokenSlot)
+    if (token === null) {
+      return { enabled: false, reason: `OpenProcessToken returned a null token handle (Win32 ${api.getLastError()}); the privilege cannot be enabled and the integrity label is skipped` }
+    }
+    if (api.closeHandle(processHandle) === 0) throwLastError(api, 'CloseHandle', 'OpenProcess process handle (privilege enable)')
+    processHandle = null
+
+    // Size query (expected to fail with ERROR_INSUFFICIENT_BUFFER) + read.
+    const neededSlot = allocUint32()
+    api.getTokenInformation(token, abi.TokenPrivileges, null, 0, neededSlot)
+    const needed = decodeUint32(neededSlot)
+    if (needed === 0) {
+      return { enabled: false, reason: `GetTokenInformation(TokenPrivileges) size query returned zero (Win32 ${api.getLastError()}); the privilege cannot be enabled and the integrity label is skipped` }
+    }
+    if (needed < 8) {
+      return { enabled: false, reason: `implausible TokenPrivileges size ${needed}` }
+    }
+    const privileges = Buffer.alloc(needed)
+    if (api.getTokenInformation(token, abi.TokenPrivileges, privileges, privileges.length, neededSlot) === 0) {
+      const code = api.getLastError()
+      return { enabled: false, reason: `GetTokenInformation(TokenPrivileges) failed (Win32 ${code}: ${privilegeMessage(api, code)}); the privilege cannot be enabled and the integrity label is skipped` }
+    }
+
+    // The LUID is an 8-byte value the caller reads back after the lookup — a
+    // plain buffer stands in for the PLUID (Luid.Low@0, Luid.High@4).
+    const luid = Buffer.alloc(8)
+    if (api.lookupPrivilegeValueW(null, abi.SE_RELABEL_NAME, luid) === 0) {
+      const code = api.getLastError()
+      return { enabled: false, reason: `LookupPrivilegeValueW(${abi.SE_RELABEL_NAME}) failed (Win32 ${code}: ${privilegeMessage(api, code)}); the privilege cannot be enabled and the integrity label is skipped` }
+    }
+    // x64 TOKEN_PRIVILEGES holding a single entry: PrivilegeCount@0 (DWORD),
+    // then one LUID_AND_ATTRIBUTES (Luid@4, Attributes@12; the entry is 12
+    // bytes, no trailing pad). AdjustTokenPrivileges reads the header's
+    // PrivilegeCount first — passing a bare LUID_AND_ATTRIBUTES lets it read
+    // the LUID's low word as the count and walk the token's privilege array
+    // far past the buffer, corrupting the process's kernel bookkeeping
+    // (libuv realpath then fails with Win32 5 for the rest of the process).
+    const newState = Buffer.alloc(abi.TOKEN_PRIVILEGES_SINGLE_SIZE)
+    newState.writeUInt32LE(1, 0) // PrivilegeCount
+    luid.copy(newState, 4)
+    newState.writeUInt32LE(abi.SE_PRIVILEGE_ENABLED, 12)
+    const returnLength = allocUint32()
+    // The BOOL return is the success signal (Win32 contract); GetLastError is
+    // consulted ONLY on failure to name 1300/1301.
+    const adjusted = api.adjustTokenPrivileges(token, 0, newState, newState.length, null, returnLength)
+    if (adjusted !== 0) {
+      return { enabled: true, reason: '' }
+    }
+    const code = api.getLastError()
+    const detail = code === abi.ERROR_NOT_ALL_ASSIGNED
+      ? `Win32 ${code}: ${privilegeMessage(api, code)} — the token holds ${abi.SE_RELABEL_NAME} but could not enable it; run DSH elevated (an elevated token carries the privilege enabled) or grant the principal the privilege, then retry`
+      : code === abi.ERROR_NO_SUCH_PRIVILEGE
+        ? `Win32 ${code}: ${privilegeMessage(api, code)} — the token does not hold ${abi.SE_RELABEL_NAME}; run DSH elevated (an elevated token carries the privilege enabled) or grant the principal the privilege, then retry`
+        : `Win32 ${code}: ${privilegeMessage(api, code)}`
+    return { enabled: false, reason: `AdjustTokenPrivileges(${abi.SE_RELABEL_NAME}) failed (${detail}); the integrity label is skipped` }
+  } catch (error) {
+    // Defensive: a missing binding in a partial stub (or any thrown call)
+    // degrades the label instead of failing the grant — the DACL is already
+    // applied and must survive.
+    const detail = error instanceof Win32Error
+      ? `${error.api} failed (Win32 ${error.win32Code})`
+      : error instanceof Error
+        ? error.message
+        : String(error)
+    return { enabled: false, reason: `${context} privilege enable failed (${detail}); the integrity label is skipped` }
+  } finally {
+    if (processHandle !== null) api.closeHandle(processHandle) // best-effort on the error paths
+    if (token !== null) api.closeHandle(token)
+  }
+}
+
+/** Release a label ACL the label step still owns (grants only; revoke steps own none). */
+function freeLabelIfOwned(api: Win32Bindings, labelEdit: LabelEdit, context: string): void {
+  if (labelEdit.kind === 'apply') {
+    const freedLabel = api.localFree(labelEdit.acl)
+    if (!isNullPtr(freedLabel)) throwLastError(api, 'LocalFree', `${context} label ACL`)
+  }
+}
+
+/**
+ * Report a degraded label: the DACL grant was applied, the integrity label
+ * was not, and the workspace binding stays live. One descriptive line carries
+ * the privilege-enable failure and the remediation — the caller (and a human
+ * triaging the workspace) sees exactly which step failed and why.
+ * @param path - the directory the grant was applied to.
+ * @param label - the caller's name (grantWrite/revokeWrite).
+ * @param reason - the privilege-enable failure from {@link ensureRelabelPrivilege}.
+ */
+function reportLabelDegrade(path: string, label: string, reason: string): void {
+  try {
+    // `reason` names the privilege the token could not enable; the SACL write
+    // additionally needs the WRITE_OWNER right on the directory (the object
+    // level icacls can grant), so the warning names both and gives the remedy.
+    console.warn(`[dsh-sandbox-windows-acl] ${label}(${path}) integrity label not applied: ${reason}. The label lives in the SACL, so applying it also needs WRITE_OWNER on the directory — run DSH elevated (for the privilege) and, if the directory lacks it, run icacls "${path}" /grant %USERNAME%:(OI)(CI)(WO); the workspace binding stays live without the label`)
+  } catch {
+    // Warnings are best-effort; a broken console must not surface as a failure.
+  }
+}
+
+/**
+ * Report a failed LABEL-step SetNamedSecurityInfoW with the full diagnostic
+ * trail (the exact Win32 code, the system text, and the privilege state that
+ * preceded it). THROWS: unlike {@link reportLabelDegrade}, the privilege was
+ * enabled yet the write was still denied — a state that needs the caller's
+ * fail-closed handling (the DACL grant has already been applied and left in
+ * place).
+ * @param api - the binding table.
+ * @param path - the directory the label write targeted.
+ * @param label - the caller's name (grantWrite/revokeWrite).
+ * @param win32Code - the SetNamedSecurityInfoW return code.
+ * @param privilege - the enable outcome that preceded the write.
+ * @returns never; always throws Win32Error.
+ */
+function reportLabelFailure(
+  api: Win32Bindings,
+  path: string,
+  label: string,
+  win32Code: number,
+  privilege: RelabelPrivilege,
+): never {
+  const message = privilegeMessage(api, win32Code)
+  const detail = `${label}(${path}) LABEL step (DACL grant applied; integrity label NOT applied) — `
+    + `privilege enable: ${privilege.reason || 'SeRelabelPrivilege enabled'}; `
+    + `Win32 ${win32Code}${message === '' ? '' : `: ${message}`} — `
+    + `the SACL write needs the SeRelabelPrivilege token privilege AND the WRITE_OWNER right on the directory: run DSH elevated and icacls "${path}" /grant %USERNAME%:(OI)(CI)(WO), then re-provision the workspace`
+  throw new Win32Error('SetNamedSecurityInfoW', win32Code, detail)
 }
 
 /**
@@ -353,21 +593,24 @@ function hasForeignGrant(oldAcl: NativePtr, sidPtr: NativePtr): boolean {
 /**
  * Grant `GRANT_MASK` (Write+Delete, displays as "Modify") to the capability SID
  * on `path`, deny the world SID the ambient `FILE_DELETE_CHILD` right, and
- * apply the Low mandatory label — one merge. The deny inherits to containers
- * only: the right is evaluated on directories, and inheriting its bit onto
- * files would deny every `FILE_ALL_ACCESS`/`GENERIC_ALL` open inside the root
- * (0x40 is a member of that mask). The capability ACE's DELETE bit is then the
- * only delete authority inside the root, so a file whose own DACL grants no
- * DELETE is no longer deletable through its parent's rights.
+ * apply the Low mandatory label — one merge, applied in two SetNamedSecurityInfoW
+ * calls ({@link mergeAndApply}): the DACL edit (capability ACE + deny) first,
+ * the Low label second, after the SeRelabelPrivilege enable. The deny inherits
+ * to containers only: the right is evaluated on directories, and inheriting its
+ * bit onto files would deny every `FILE_ALL_ACCESS`/`GENERIC_ALL` open inside
+ * the root (0x40 is a member of that mask). The capability ACE's DELETE bit is
+ * then the only delete authority inside the root, so a file whose own DACL
+ * grants no DELETE is no longer deletable through its parent's rights.
  *
  * Idempotent: the exact ACE, deny, and label together SKIP the
  * SetNamedSecurityInfoW apply, which would otherwise re-propagate the
  * identical descriptor across the whole tree (eager inheritance; minutes on
  * large workspaces). Otherwise read-merge-write, so pre-existing explicit ACEs
  * survive (same shape as {@link revokeWrite}). Runs under the per-path lock.
- * The directory must be owned by the caller AND grant WRITE_OWNER (the label
- * lives in the SACL; owner-implicit rights cover only READ_CONTROL and
- * WRITE_DAC) — a Full-control workspace satisfies both.
+ * The directory must be owned by the caller (owner-implicit WRITE_DAC covers
+ * the DACL step). The LABEL step additionally needs SeRelabelPrivilege (the
+ * SACL write): when the privilege cannot be enabled the label degrades to a
+ * diagnostic warning and the DACL grant — the workspace binding — stands.
  * @param api - the binding table.
  * @param path - the directory whose DACL and label gain the grant (the workspace or temp root).
  * @param sidPtr - the capability SID the ACE names.

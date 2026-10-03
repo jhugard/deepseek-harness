@@ -134,6 +134,8 @@ function happyStubs(): HappyStubs {
     return 1
   })
   const setTokenInformation = vi.fn(() => 1)
+  const lookupPrivilegeValueW = vi.fn(() => 1)
+  const adjustTokenPrivileges = vi.fn(() => 1)
   const createPipe = vi.fn((readSlot: NativePtr, writeSlot: NativePtr) => {
     koffi.encode(readSlot, PVOID, fresh())
     koffi.encode(writeSlot, PVOID, fresh())
@@ -171,7 +173,7 @@ function happyStubs(): HappyStubs {
     getNamedSecurityInfoW, setEntriesInAclW, setNamedSecurityInfoW, getTokenInformation,
     localAlloc, initializeAcl, addMandatoryAce,
     getLengthSid, copySid, createWellKnownSid, isValidSid, createRestrictedToken,
-    setTokenInformation, createPipe, setHandleInformation, createProcessAsUserW,
+    setTokenInformation, lookupPrivilegeValueW, adjustTokenPrivileges, createPipe, setHandleInformation, createProcessAsUserW,
     peekNamedPipe, readFile, waitForSingleObject, getExitCodeProcess, createJobObjectW,
     setInformationJobObject, assignProcessToJobObject, resumeThread, terminateProcess,
     getStdHandle,
@@ -239,7 +241,8 @@ describe('AclSandbox init', () => {
     })
     await sandbox.init()
     expect(sandbox.tempDir).toBe(resolve(temp))
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
+    // workspace grant + temp grant, each a DACL step and a LABEL step.
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(4)
   })
 
   it('requires an explicit private temp directory or null under workspace-write', () => {
@@ -253,7 +256,7 @@ describe('AclSandbox init', () => {
     const workspace = scratch()
     const sandbox = new AclSandbox({ writableDirs: [workspace], tempDir: null, writeSid: 'S-1-4-9000-3', mode: 'workspace-write' })
     await sandbox.init()
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1) // workspace only
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2) // workspace only: DACL step + LABEL step
   })
 
   it('rejects a temp dir that does not exist', async () => {

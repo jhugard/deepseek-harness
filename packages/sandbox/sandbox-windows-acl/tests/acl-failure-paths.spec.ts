@@ -14,7 +14,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Mock } from 'vitest'
 import koffi from 'koffi'
 
-import { grantWrite, revokeWrite, withPathLock } from '../src/acl.ts'
+import { ensureRelabelPrivilege, grantWrite, revokeWrite, withPathLock } from '../src/acl.ts'
 import { allocBytes, ptrAddress } from '../src/ffi.ts'
 import type { NativePtr, Win32Bindings } from '../src/ffi.ts'
 import * as abi from '../src/win32-abi.ts'
@@ -47,6 +47,25 @@ function aclApi(overrides: Partial<Win32Bindings> = {}): Win32Bindings {
       return 0
     }),
     setNamedSecurityInfoW: vi.fn(() => 0),
+    openProcess: vi.fn(() => 13n),
+    openProcessToken: vi.fn((_process: unknown, _access: unknown, slot: NativePtr) => {
+      koffi.encode(slot, PVOID, 14n)
+      return 1
+    }),
+    getTokenInformation: vi.fn((_token: unknown, _cls: number, info: Buffer | null, _length: number, needed: NativePtr) => {
+      if (info === null) {
+        koffi.encode(needed, 'uint32', 8)
+        return 0 // the TokenPrivileges size probe is expected to "fail"
+      }
+      info.writeUInt32LE(1, 0) // PrivilegeCount
+      return 1
+    }),
+    lookupPrivilegeValueW: vi.fn((_system: unknown, _name: unknown, luid: Buffer) => {
+      luid.writeUInt32LE(0x00010000, 0) // Luid.Low — the value is irrelevant to the stub
+      luid.writeUInt32LE(0, 4) // Luid.High
+      return 1
+    }),
+    adjustTokenPrivileges: vi.fn(() => 1),
     localAlloc: vi.fn(() => 11n),
     getLengthSid: vi.fn(() => 12),
     initializeAcl: vi.fn(() => 1),
@@ -172,12 +191,24 @@ function readStub(dacl: NativePtr | null, label: NativePtr | null, descriptor: b
   })
 }
 
+function requireApplyCall(
+  setNamedSecurityInfoW: Mock<Win32Bindings['setNamedSecurityInfoW']>,
+  index: number,
+): Parameters<Win32Bindings['setNamedSecurityInfoW']> {
+  const call = setNamedSecurityInfoW.mock.calls.at(index)
+  expect(call).toBeDefined()
+  if (call === undefined) {
+    throw new Error(`Expected SetNamedSecurityInfoW call ${index + 1}`)
+  }
+  return call
+}
+
 describe('withPathLock failure paths', () => {
   it('fails closed when CreateFileW returns an invalid handle', () => {
     const api = aclApi({ createFileW: vi.fn(() => 0n as NativePtr) })
     let caught: unknown
     try {
-      withPathLock(api, 'C:\\locked', () => {})
+      withPathLock(api, 'C:\locked', () => {})
     } catch (error) {
       caught = error
     }
@@ -633,7 +664,7 @@ describe('the exact-ACE/exact-label skip and ACL-walk defenses', () => {
       setNamedSecurityInfoW,
     })
     grantWrite(api, 'C:\\granted', sid, lowSid, world)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
   })
 
   it('does not skip when the deny names another trustee', () => {
@@ -648,7 +679,7 @@ describe('the exact-ACE/exact-label skip and ACL-walk defenses', () => {
       setNamedSecurityInfoW,
     })
     grantWrite(api, 'C:\\granted', sid, lowSid, world)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
   })
 
   it('does not treat a deny of another right as the ambient-delete deny', () => {
@@ -663,7 +694,7 @@ describe('the exact-ACE/exact-label skip and ACL-walk defenses', () => {
       setNamedSecurityInfoW,
     })
     grantWrite(api, 'C:\\granted', sid, lowSid, world)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
   })
 
   it('does not treat an Allow ACE as the ambient-delete deny', () => {
@@ -678,7 +709,7 @@ describe('the exact-ACE/exact-label skip and ACL-walk defenses', () => {
       setNamedSecurityInfoW,
     })
     grantWrite(api, 'C:\\granted', sid, lowSid, world)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
   })
 
   it('does not skip when the standing ACE and label match but the label ACL is absent', () => {
@@ -691,7 +722,7 @@ describe('the exact-ACE/exact-label skip and ACL-walk defenses', () => {
       setNamedSecurityInfoW,
     })
     grantWrite(api, 'C:\\granted', sid, lowSid, world)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
   })
 
   it('does not skip when the exact ACE stands but the label names another integrity level', () => {
@@ -704,7 +735,7 @@ describe('the exact-ACE/exact-label skip and ACL-walk defenses', () => {
       setNamedSecurityInfoW,
     })
     grantWrite(api, 'C:\\granted', sid, lowSid, world)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
   })
 
   it('falls back to the merge path when the standing ACE names a different SID', () => {
@@ -717,7 +748,7 @@ describe('the exact-ACE/exact-label skip and ACL-walk defenses', () => {
       setNamedSecurityInfoW,
     })
     grantWrite(api, 'C:\\granted', sid, lowSid, world)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
   })
 
   it('treats an implausibly small ACL size as no exact grant', () => {
@@ -734,7 +765,7 @@ describe('the exact-ACE/exact-label skip and ACL-walk defenses', () => {
       setNamedSecurityInfoW,
     })
     grantWrite(api, 'C:\\granted', sid, lowSid, world)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
   })
 
   it('treats an ACE that would overrun the ACL as no exact grant', () => {
@@ -752,7 +783,7 @@ describe('the exact-ACE/exact-label skip and ACL-walk defenses', () => {
       setNamedSecurityInfoW,
     })
     grantWrite(api, 'C:\\granted', sid, lowSid, world)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
   })
 
   it('treats an implausibly small label ACL size as no exact label', () => {
@@ -769,7 +800,7 @@ describe('the exact-ACE/exact-label skip and ACL-walk defenses', () => {
       setNamedSecurityInfoW,
     })
     grantWrite(api, 'C:\\granted', sid, lowSid, world)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
   })
 
   it('treats a label ACE that would overrun its ACL as no exact label', () => {
@@ -787,7 +818,7 @@ describe('the exact-ACE/exact-label skip and ACL-walk defenses', () => {
       setNamedSecurityInfoW,
     })
     grantWrite(api, 'C:\\granted', sid, lowSid, world)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
   })
 
   it('does not treat a no-write-up ACL Allow ACE as the mandatory label', () => {
@@ -805,7 +836,7 @@ describe('the exact-ACE/exact-label skip and ACL-walk defenses', () => {
       setNamedSecurityInfoW,
     })
     grantWrite(api, 'C:\\granted', sid, lowSid, world)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
   })
 
   it('does not treat a label ACE granting write-up as the exact label', () => {
@@ -822,7 +853,134 @@ describe('the exact-ACE/exact-label skip and ACL-walk defenses', () => {
       setNamedSecurityInfoW,
     })
     grantWrite(api, 'C:\\granted', sid, lowSid, world)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('the decoupled DACL / LABEL apply', () => {
+  it('applies the grant in a DACL-only call followed by a LABEL-only call carrying the label ACE', () => {
+    const sid = craftSid(1, 0)
+    const lowSid = craftLowLabelSid()
+    const world = craftWorldSid()
+    const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => 0)
+    const api = aclApi({ setNamedSecurityInfoW })
+    grantWrite(api, 'C:\\granted', sid, lowSid, world)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
+    const daclCall = requireApplyCall(setNamedSecurityInfoW, 0)
+    const labelCall = requireApplyCall(setNamedSecurityInfoW, 1)
+    // Step A: the DACL edit alone — no label bit, no SACL pointer.
+    expect(daclCall[2] & abi.DACL_SECURITY_INFORMATION).toBe(abi.DACL_SECURITY_INFORMATION)
+    expect(daclCall[2] & abi.LABEL_SECURITY_INFORMATION).toBe(0)
+    expect(daclCall[5]).toBe(9n) // the merged capability + deny ACL
+    expect(daclCall[6]).toBeNull()
+    // Step C: the label edit alone — the LABEL bit, the Low ACE in the SACL slot.
+    expect(labelCall[2]).toBe(abi.LABEL_SECURITY_INFORMATION)
+    expect(labelCall[5]).toBeNull()
+    expect(labelCall[6]).toBe(11n) // the label ACL built by buildLowLabelAcl
+  })
+
+  it('degrades the label (no throw, no LABEL call) when the privilege cannot be enabled', () => {
+    const sid = craftSid(1, 0)
+    const lowSid = craftLowLabelSid()
+    const world = craftWorldSid()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => 0)
+    const api = aclApi({
+      setNamedSecurityInfoW,
+      adjustTokenPrivileges: vi.fn(() => 0), // the enable fails
+      getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+    })
+    expect(() => grantWrite(api, 'C:\\granted', sid, lowSid, world)).not.toThrow()
+    // Only the DACL step went out; the label step never ran.
     expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    const daclCall = requireApplyCall(setNamedSecurityInfoW, 0)
+    expect(daclCall[2] & abi.DACL_SECURITY_INFORMATION).toBe(abi.DACL_SECURITY_INFORMATION)
+    expect(daclCall[2] & abi.LABEL_SECURITY_INFORMATION).toBe(0)
+    // The label ACL is released and the diagnostic names the privilege gap.
+    expect(api.localFree).toHaveBeenCalledWith(11n)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(String(warn.mock.calls.at(0)?.[0])).toContain('SeRelabelPrivilege')
+    warn.mockRestore()
+  })
+
+  it('survives a stub without the privilege bindings (defensive degrade, no throw, no LABEL call)', () => {
+    // A partial stub without openProcess/openProcessToken/getTokenInformation/
+    // lookupPrivilegeValueW/adjustTokenPrivileges: the helper must degrade the
+    // label instead of failing the grant.
+    const { api, setNamedSecurityInfoW } = (() => {
+      const base = aclApi({})
+      const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => 0)
+      const partialApi: Partial<Win32Bindings> = { ...base, setNamedSecurityInfoW }
+      delete partialApi.openProcess
+      delete partialApi.openProcessToken
+      delete partialApi.getTokenInformation
+      delete partialApi.lookupPrivilegeValueW
+      delete partialApi.adjustTokenPrivileges
+      return { api: partialApi as Win32Bindings, setNamedSecurityInfoW }
+    })()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    expect(() => grantWrite(api, 'C:\\granted', craftSid(1, 0), craftLowLabelSid(), craftWorldSid())).not.toThrow()
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    const daclCall = requireApplyCall(setNamedSecurityInfoW, 0)
+    expect(daclCall[2] & abi.LABEL_SECURITY_INFORMATION).toBe(0)
+    warn.mockRestore()
+  })
+})
+
+describe('ensureRelabelPrivilege failure paths', () => {
+  it('reports a failed OpenProcessToken without throwing', () => {
+    const api = aclApi({ openProcessToken: vi.fn(() => 0), getLastError: vi.fn(() => 87) })
+    const result = ensureRelabelPrivilege(api, 'test')
+    expect(result.enabled).toBe(false)
+    expect(result.reason).toContain('OpenProcessToken')
+    expect(result.reason).toContain('Win32 87')
+  })
+
+  it('reports a failed GetTokenInformation read without throwing', () => {
+    const api = aclApi({
+      getTokenInformation: vi.fn((_token: unknown, _cls: number, info: Buffer | null, _length: number, needed: NativePtr) => {
+        if (info === null) {
+          koffi.encode(needed, 'uint32', 8)
+          return 0
+        }
+        return 0 // the read fails
+      }),
+      getLastError: vi.fn(() => 22),
+    })
+    const result = ensureRelabelPrivilege(api, 'test')
+    expect(result.enabled).toBe(false)
+    expect(result.reason).toContain('GetTokenInformation')
+  })
+
+  it('reports a failed LookupPrivilegeValueW without throwing', () => {
+    const api = aclApi({ lookupPrivilegeValueW: vi.fn(() => 0), getLastError: vi.fn(() => 1301) })
+    const result = ensureRelabelPrivilege(api, 'test')
+    expect(result.enabled).toBe(false)
+    expect(result.reason).toContain('LookupPrivilegeValueW')
+  })
+
+  it('reports ERROR_NO_SUCH_PRIVILEGE from a failed AdjustTokenPrivileges', () => {
+    const api = aclApi({
+      adjustTokenPrivileges: vi.fn(() => 0),
+      getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+    })
+    const result = ensureRelabelPrivilege(api, 'test')
+    expect(result.enabled).toBe(false)
+    expect(result.reason).toContain('Win32 1301')
+    expect(result.reason).toContain('SeRelabelPrivilege')
+  })
+
+  it('enables the privilege and returns the success outcome', () => {
+    const lookup = vi.fn<Win32Bindings['lookupPrivilegeValueW']>((_system, _name, luid) => {
+      luid.writeUInt32LE(0x00010000, 0)
+      luid.writeUInt32LE(0, 4)
+      return 1
+    })
+    const api = aclApi({ lookupPrivilegeValueW: lookup })
+    const result = ensureRelabelPrivilege(api, 'test')
+    expect(result.enabled).toBe(true)
+    expect(result.reason).toBe('')
+    expect(lookup.mock.calls.at(0)?.[1]).toBe('SeRelabelPrivilege')
   })
 })
 
