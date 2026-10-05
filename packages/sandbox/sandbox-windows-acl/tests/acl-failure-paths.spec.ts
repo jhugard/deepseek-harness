@@ -879,34 +879,41 @@ describe('the decoupled DACL / LABEL apply', () => {
     expect(labelCall[6]).toBe(11n) // the label ACL built by buildLowLabelAcl
   })
 
-  it('degrades the label (no throw, no LABEL call) when the privilege cannot be enabled', () => {
+  it('attempts the LABEL even when the privilege cannot be enabled (it may pass on WRITE_OWNER)', () => {
     const sid = craftSid(1, 0)
     const lowSid = craftLowLabelSid()
     const world = craftWorldSid()
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => 0)
+    const localFree = vi.fn(() => 0n as NativePtr)
     const api = aclApi({
       setNamedSecurityInfoW,
       adjustTokenPrivileges: vi.fn(() => 0), // the enable fails
       getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+      localFree,
     })
-    expect(() => grantWrite(api, 'C:\\granted', sid, lowSid, world)).not.toThrow()
-    // Only the DACL step went out; the label step never ran.
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    expect(() => {
+      grantWrite(api, 'C:\\granted', sid, lowSid, world)
+    }).not.toThrow()
+    // Both steps went out: the privilege was never the only gate — an owner
+    // (or inherited Full/Modify) passes the LABEL write without it.
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
     const daclCall = requireApplyCall(setNamedSecurityInfoW, 0)
     expect(daclCall[2] & abi.DACL_SECURITY_INFORMATION).toBe(abi.DACL_SECURITY_INFORMATION)
     expect(daclCall[2] & abi.LABEL_SECURITY_INFORMATION).toBe(0)
-    // The label ACL is released and the diagnostic names the privilege gap.
-    expect(api.localFree).toHaveBeenCalledWith(11n)
-    expect(warn).toHaveBeenCalledTimes(1)
-    expect(String(warn.mock.calls.at(0)?.[0])).toContain('SeRelabelPrivilege')
+    const labelCall = requireApplyCall(setNamedSecurityInfoW, 1)
+    expect(labelCall[2]).toBe(abi.LABEL_SECURITY_INFORMATION)
+    // The label ACL is released; no degrade warning — the label was applied.
+    expect(localFree).toHaveBeenCalledWith(11n)
+    expect(warn).not.toHaveBeenCalled()
     warn.mockRestore()
   })
 
-  it('survives a stub without the privilege bindings (defensive degrade, no throw, no LABEL call)', () => {
+  it('survives a stub without the privilege bindings (LABEL still attempted, succeeds)', () => {
     // A partial stub without openProcess/openProcessToken/getTokenInformation/
-    // lookupPrivilegeValueW/adjustTokenPrivileges: the helper must degrade the
-    // label instead of failing the grant.
+    // lookupPrivilegeValueW/adjustTokenPrivileges: the privilege helper reports
+    // it unavailable, the LABEL still goes out, and a success keeps the grant
+    // whole — the label is never skipped because the privilege step broke.
     const { api, setNamedSecurityInfoW } = (() => {
       const base = aclApi({})
       const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => 0)
@@ -918,12 +925,144 @@ describe('the decoupled DACL / LABEL apply', () => {
       delete partialApi.adjustTokenPrivileges
       return { api: partialApi as Win32Bindings, setNamedSecurityInfoW }
     })()
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    expect(() => grantWrite(api, 'C:\\granted', craftSid(1, 0), craftLowLabelSid(), craftWorldSid())).not.toThrow()
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1)
+    expect(() => {
+      grantWrite(api, 'C:\\granted', craftSid(1, 0), craftLowLabelSid(), craftWorldSid())
+    }).not.toThrow()
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
     const daclCall = requireApplyCall(setNamedSecurityInfoW, 0)
     expect(daclCall[2] & abi.LABEL_SECURITY_INFORMATION).toBe(0)
-    warn.mockRestore()
+    const labelCall = requireApplyCall(setNamedSecurityInfoW, 1)
+    expect(labelCall[2]).toBe(abi.LABEL_SECURITY_INFORMATION)
+  })
+
+  it('throws fail-closed when the LABEL is denied and no self-heal applies (privilege enabled)', () => {
+    // Privilege enabled but the write denied: the heal is for the no-privilege
+    // case only (an enabled privilege outranks object rights), so this fails
+    // closed naming the true gate instead of reporting success.
+    const sid = craftSid(1, 0)
+    const lowSid = craftLowLabelSid()
+    const world = craftWorldSid()
+    const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>((_p: unknown, _t: unknown, info: number) =>
+      (info & abi.LABEL_SECURITY_INFORMATION) !== 0 ? abi.ERROR_ACCESS_DENIED : 0)
+    const api = aclApi({ setNamedSecurityInfoW })
+    expect(() => {
+      grantWrite(api, 'C:\\granted', sid, lowSid, world)
+    }).toThrow(/WRITE_OWNER/)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2) // DACL + one LABEL
+    const labelCall = requireApplyCall(setNamedSecurityInfoW, 1)
+    expect(labelCall[2]).toBe(abi.LABEL_SECURITY_INFORMATION)
+  })
+
+  it('self-heals a denied LABEL with a temporary caller WRITE_OWNER and revokes it', () => {
+    const sid = craftSid(1, 0)
+    const lowSid = craftLowLabelSid()
+    const world = craftWorldSid()
+    const selfUser = craftSid(1, 1, [0, 0, 0, 0, 0, 5])
+    // Call sequence: DACL grant OK, LABEL denied, heal WO-grant DACL OK,
+    // LABEL retry OK, restore pre-heal DACL OK.
+    const results = [0, abi.ERROR_ACCESS_DENIED, 0, 0, 0]
+    const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => results.shift() ?? 0)
+    const setEntriesInAclW = vi.fn<Win32Bindings['setEntriesInAclW']>((_count: unknown, entries: Buffer, _old: unknown, newAcl: NativePtr) => {
+      koffi.encode(newAcl, PVOID, 9n)
+      // Remember the EXPLICIT_ACCESS_W.grfAccessMode of every merge.
+      healModes.push(koffi.decode(entries, 4, 'int32') as number)
+      return 0
+    })
+    const healModes: number[] = []
+    const api = aclApi({
+      setNamedSecurityInfoW,
+      setEntriesInAclW,
+      // A real (non-null) DACL to merge the temporary WRITE_OWNER into.
+      getNamedSecurityInfoW: readStub(craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true), null, 6n),
+      adjustTokenPrivileges: vi.fn(() => 0), // no privilege: the heal branch
+      getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+      getTokenInformation: vi.fn((_token: unknown, cls: number, info: Buffer | null, _length: number, needed: NativePtr) => {
+        if (info === null) {
+          koffi.encode(needed, 'uint32', 8)
+          return 0
+        }
+        if (cls === abi.TokenUser) {
+          koffi.encode(info, 0, PVOID, ptrAddress(selfUser)) // TOKEN_USER.Sid
+          return 1
+        }
+        info.writeUInt32LE(1, 0)
+        return 1
+      }),
+      copySid: vi.fn(() => 1),
+    })
+    expect(() => {
+      grantWrite(api, 'C:\\granted', sid, lowSid, world)
+    }).not.toThrow()
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(5)
+    expect(requireApplyCall(setNamedSecurityInfoW, 2)[2]).toBe(abi.DACL_SECURITY_INFORMATION) // WO grant pass
+    const retry = requireApplyCall(setNamedSecurityInfoW, 3)
+    expect(retry[2]).toBe(abi.LABEL_SECURITY_INFORMATION) // the label persisted on retry
+    expect(requireApplyCall(setNamedSecurityInfoW, 4)[2]).toBe(abi.DACL_SECURITY_INFORMATION) // restore pass
+    // The restore pass rewrites the pre-heal ACL directly (no merge), so only
+    // two merges ran: the grant's own (deny entry packed first) and the heal's
+    // WRITE_OWNER grant.
+    expect(healModes).toEqual([abi.DENY_ACCESS, abi.GRANT_ACCESS])
+  })
+
+  it('fails closed when the LABEL stays denied even after the WRITE_OWNER heal', () => {
+    const sid = craftSid(1, 0)
+    const lowSid = craftLowLabelSid()
+    const world = craftWorldSid()
+    const selfUser = craftSid(1, 1, [0, 0, 0, 0, 0, 5])
+    // The LABEL denies on BOTH attempts: DACL grant OK, LABEL 5, heal grant OK,
+    // retry 5, revoke OK.
+    const results = [0, abi.ERROR_ACCESS_DENIED, 0, abi.ERROR_ACCESS_DENIED, 0]
+    const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => results.shift() ?? 0)
+    const api = aclApi({
+      setNamedSecurityInfoW,
+      // A real (non-null) DACL so the heal's WRITE_OWNER merge can proceed.
+      getNamedSecurityInfoW: readStub(craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true), null, 6n),
+      adjustTokenPrivileges: vi.fn(() => 0), // no privilege
+      getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+      getTokenInformation: vi.fn((_token: unknown, cls: number, info: Buffer | null, _length: number, needed: NativePtr) => {
+        if (info === null) {
+          koffi.encode(needed, 'uint32', 8)
+          return 0
+        }
+        if (cls === abi.TokenUser) {
+          koffi.encode(info, 0, PVOID, ptrAddress(selfUser))
+          return 1
+        }
+        info.writeUInt32LE(1, 0)
+        return 1
+      }),
+      copySid: vi.fn(() => 1),
+    })
+    let caught: unknown
+    try {
+      grantWrite(api, 'C:\\granted', sid, lowSid, world)
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(Win32Error)
+    expect((caught as Win32Error).win32Code).toBe(abi.ERROR_ACCESS_DENIED)
+    expect((caught as Error).message).toContain('WRITE_OWNER')
+    expect((caught as Error).message).toContain('self-heal was attempted and failed')
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(5)
+  })
+
+  it('reports the original denial when the heal cannot read the caller identity', () => {
+    const sid = craftSid(1, 0)
+    const lowSid = craftLowLabelSid()
+    const world = craftWorldSid()
+    // LABEL denied; the identity read fails (no copySid binding) so the heal
+    // aborts without touching the DACL and the original error surfaces.
+    const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>((_p: unknown, _t: unknown, info: number) =>
+      (info & abi.LABEL_SECURITY_INFORMATION) !== 0 ? abi.ERROR_ACCESS_DENIED : 0)
+    const api = aclApi({
+      setNamedSecurityInfoW,
+      adjustTokenPrivileges: vi.fn(() => 0),
+      getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+    })
+    expect(() => {
+      grantWrite(api, 'C:\\granted', sid, lowSid, world)
+    }).toThrow(/self-heal was attempted and failed/)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2) // DACL + LABEL only
   })
 })
 
@@ -976,11 +1115,26 @@ describe('ensureRelabelPrivilege failure paths', () => {
       luid.writeUInt32LE(0, 4)
       return 1
     })
-    const api = aclApi({ lookupPrivilegeValueW: lookup })
+    // getLastError 0: the clean enable leaves no residual error.
+    const api = aclApi({ lookupPrivilegeValueW: lookup, getLastError: vi.fn(() => 0) })
     const result = ensureRelabelPrivilege(api, 'test')
     expect(result.enabled).toBe(true)
     expect(result.reason).toBe('')
     expect(lookup.mock.calls.at(0)?.[1]).toBe('SeRelabelPrivilege')
+  })
+
+  it('reports the privilege as NOT held when AdjustTokenPrivileges returns TRUE with 1300', () => {
+    // The Win32 quirk: the BOOL is TRUE even though the privilege was left
+    // unassigned — GetLastError carries ERROR_NOT_ALL_ASSIGNED, and treating
+    // the BOOL alone as success is what used to mask the missing privilege.
+    const api = aclApi({
+      adjustTokenPrivileges: vi.fn(() => 1),
+      getLastError: vi.fn(() => abi.ERROR_NOT_ALL_ASSIGNED),
+    })
+    const result = ensureRelabelPrivilege(api, 'test')
+    expect(result.enabled).toBe(false)
+    expect(result.reason).toContain('Win32 1300')
+    expect(result.reason).toContain('SeRelabelPrivilege')
   })
 })
 
@@ -1017,5 +1171,540 @@ describe('revokeWrite no-DACL path', () => {
     }
     expect(caught).toBeInstanceOf(Win32Error)
     expect((caught as Win32Error).api).toBe('LocalFree')
+  })
+})
+
+describe('ensureRelabelPrivilege remaining failure paths', () => {
+  it('reports a failed OpenProcess without throwing', () => {
+    const api = aclApi({ openProcess: vi.fn(() => 0n as NativePtr), getLastError: vi.fn(() => 5) })
+    const result = ensureRelabelPrivilege(api, 'test')
+    expect(result.enabled).toBe(false)
+    expect(result.reason).toContain('OpenProcess failed')
+    expect(result.reason).toContain('Win32 5')
+  })
+
+  it('reports a null token handle without throwing', () => {
+    const api = aclApi({
+      openProcessToken: vi.fn((_process: unknown, _access: unknown, slot: NativePtr) => {
+        koffi.encode(slot, PVOID, 0n)
+        return 1
+      }),
+      getLastError: vi.fn(() => 5),
+    })
+    const result = ensureRelabelPrivilege(api, 'test')
+    expect(result.enabled).toBe(false)
+    expect(result.reason).toContain('null token handle')
+  })
+
+  it('survives a failed CloseHandle on the process handle (reports the privilege as unavailable)', () => {
+    // The checked CloseHandle at the start of the enable throws into the
+    // catch-all, which surfaces the Win32Error as the reason instead of the
+    // privilege being silently reported as enabled.
+    const api = aclApi({ closeHandle: vi.fn(() => 0), getLastError: vi.fn(() => 5) })
+    const result = ensureRelabelPrivilege(api, 'test')
+    expect(result.enabled).toBe(false)
+    expect(result.reason).toContain('privilege enable failed')
+    expect(result.reason).toContain('CloseHandle failed (Win32 5)')
+  })
+
+  it('reports a zero-size TokenPrivileges query without throwing', () => {
+    const api = aclApi({
+      getTokenInformation: vi.fn((_token: unknown, _cls: number, info: Buffer | null, _length: number, needed: NativePtr) => {
+        if (info === null) {
+          koffi.encode(needed, 'uint32', 0)
+          return 0
+        }
+        return 1
+      }),
+      getLastError: vi.fn(() => 5),
+    })
+    const result = ensureRelabelPrivilege(api, 'test')
+    expect(result.enabled).toBe(false)
+    expect(result.reason).toContain('size query returned zero')
+  })
+
+  it('reports an implausible TokenPrivileges size without throwing', () => {
+    const api = aclApi({
+      getTokenInformation: vi.fn((_token: unknown, _cls: number, info: Buffer | null, _length: number, needed: NativePtr) => {
+        if (info === null) {
+          koffi.encode(needed, 'uint32', 4)
+          return 0
+        }
+        return 1
+      }),
+    })
+    const result = ensureRelabelPrivilege(api, 'test')
+    expect(result.enabled).toBe(false)
+    expect(result.reason).toContain('implausible TokenPrivileges size 4')
+  })
+
+  it('reports a token that holds the privilege but could not enable it (1300)', () => {
+    const api = aclApi({
+      adjustTokenPrivileges: vi.fn(() => 0),
+      getLastError: vi.fn(() => abi.ERROR_NOT_ALL_ASSIGNED),
+    })
+    const result = ensureRelabelPrivilege(api, 'test')
+    expect(result.enabled).toBe(false)
+    expect(result.reason).toContain('Win32 1300')
+    expect(result.reason).toContain('could not enable it')
+  })
+
+  it('reports the generic AdjustTokenPrivileges failure detail for an unknown code', () => {
+    const api = aclApi({
+      adjustTokenPrivileges: vi.fn(() => 0),
+      getLastError: vi.fn(() => 1311), // neither 1300 (not-all-assigned) nor 1301 (no-such-privilege)
+    })
+    const result = ensureRelabelPrivilege(api, 'test')
+    expect(result.enabled).toBe(false)
+    expect(result.reason).toContain('Win32 1311')
+    expect(result.reason).not.toContain('does not hold')
+    expect(result.reason).not.toContain('could not enable it')
+  })
+
+  it('reports a non-Error throw from a binding as its string form', () => {
+    const api = aclApi({ openProcess: vi.fn(() => { throw 'boom' }) })
+    const result = ensureRelabelPrivilege(api, 'test')
+    expect(result.enabled).toBe(false)
+    expect(result.reason).toContain('(boom)')
+  })
+})
+
+describe('readCallerUserSid sub-failures (driven through the grant self-heal)', () => {
+  // Shared scaffolding: a real (non-exact) DACL, the LABEL denied, and the
+  // privilege disabled, so every grantWrite reaches healLabelAccess and the
+  // injected failure lands in the heal's identity read.
+  function deniedLabelApi(overrides: Partial<Win32Bindings> = {}) {
+    const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>((_p: unknown, _t: unknown, info: number) =>
+      (info & abi.LABEL_SECURITY_INFORMATION) !== 0 ? abi.ERROR_ACCESS_DENIED : 0)
+    const world = craftWorldSid()
+    const api = aclApi({
+      setNamedSecurityInfoW,
+      getNamedSecurityInfoW: readStub(craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true), null, 6n),
+      adjustTokenPrivileges: vi.fn(() => 0), // no privilege: the heal branch
+      getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+      ...overrides,
+    })
+    return { api, setNamedSecurityInfoW }
+  }
+
+  function assertSelfHealAborted(caught: unknown, setNamedSecurityInfoW: Mock<Win32Bindings['setNamedSecurityInfoW']>): void {
+    expect(caught).toBeInstanceOf(Win32Error)
+    expect((caught as Win32Error).win32Code).toBe(abi.ERROR_ACCESS_DENIED)
+    expect((caught as Error).message).toContain('self-heal was attempted and failed')
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2) // DACL + LABEL, no heal writes
+  }
+
+  it('reports the denial when the identity OpenProcess fails', () => {
+    const { api, setNamedSecurityInfoW } = deniedLabelApi({ openProcess: vi.fn(() => 0n as NativePtr) })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+  })
+
+  it('reports the denial when the identity OpenProcessToken fails', () => {
+    const { api, setNamedSecurityInfoW } = deniedLabelApi({ openProcessToken: vi.fn(() => 0) })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+  })
+
+  it('reports the denial when the identity token handle is null', () => {
+    const { api, setNamedSecurityInfoW } = deniedLabelApi({
+      openProcessToken: vi.fn((_process: unknown, _access: unknown, slot: NativePtr) => {
+        koffi.encode(slot, PVOID, 0n)
+        return 1
+      }),
+    })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+  })
+
+  it('reports the denial when the TokenUser size query is implausible', () => {
+    const { api, setNamedSecurityInfoW } = deniedLabelApi({
+      getTokenInformation: vi.fn((_token: unknown, cls: number, info: Buffer | null, _length: number, needed: NativePtr) => {
+        if (info === null) {
+          if (cls === abi.TokenUser) {
+            koffi.encode(needed, 'uint32', 4)
+            return 0
+          }
+          koffi.encode(needed, 'uint32', 8)
+          return 0
+        }
+        info.writeUInt32LE(1, 0)
+        return 1
+      }),
+    })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+  })
+
+  it('reports the denial when the TokenUser read fails', () => {
+    const { api, setNamedSecurityInfoW } = deniedLabelApi({
+      getTokenInformation: vi.fn((_token: unknown, cls: number, info: Buffer | null, _length: number, needed: NativePtr) => {
+        if (info === null) {
+          koffi.encode(needed, 'uint32', 8)
+          return 0
+        }
+        if (cls === abi.TokenUser) return 0 // the TokenUser read fails
+        info.writeUInt32LE(1, 0)
+        return 1
+      }),
+    })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+  })
+
+  it('reports the denial when the TokenUser read yields a null SID', () => {
+    const { api, setNamedSecurityInfoW } = deniedLabelApi({
+      getTokenInformation: vi.fn((_token: unknown, cls: number, info: Buffer | null, _length: number, needed: NativePtr) => {
+        if (info === null) {
+          koffi.encode(needed, 'uint32', 8)
+          return 0
+        }
+        if (cls === abi.TokenUser) {
+          koffi.encode(info, 0, PVOID, 0n) // a null SID pointer
+          return 1
+        }
+        info.writeUInt32LE(1, 0)
+        return 1
+      }),
+    })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+  })
+
+  it('reports the denial when GetLengthSid rejects the identity SID', () => {
+    const selfUser = craftSid(1, 1, [0, 0, 0, 0, 0, 5])
+    const { api, setNamedSecurityInfoW } = deniedLabelApi({
+      getTokenInformation: vi.fn((_token: unknown, cls: number, info: Buffer | null, _length: number, needed: NativePtr) => {
+        if (info === null) {
+          koffi.encode(needed, 'uint32', 8)
+          return 0
+        }
+        if (cls === abi.TokenUser) {
+          koffi.encode(info, 0, PVOID, ptrAddress(selfUser))
+          return 1
+        }
+        info.writeUInt32LE(1, 0)
+        return 1
+      }),
+      getLengthSid: vi.fn((sid: NativePtr) => (ptrAddress(sid) === ptrAddress(selfUser) ? 0 : 12)),
+    })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+  })
+
+  it('reports the denial when the identity SID copy allocation fails', () => {
+    // First localAlloc (the label ACL) succeeds; the second (the SID copy) fails.
+    const { api, setNamedSecurityInfoW } = deniedLabelApi({
+      localAlloc: vi.fn(() => 0n as NativePtr).mockReturnValueOnce(11n as NativePtr),
+    })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+  })
+
+  it('reports the denial when CopySid fails', () => {
+    const { api, setNamedSecurityInfoW } = deniedLabelApi({ copySid: vi.fn(() => 0) })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+  })
+
+  it('reports the denial when the identity token handle cannot be closed', () => {
+    // The identity read itself succeeds; only the checked token CloseHandle in
+    // its finally fails, so the heal still aborts on the thrown Win32Error.
+    const { api, setNamedSecurityInfoW } = deniedLabelApi({
+      copySid: vi.fn(() => 1),
+      closeHandle: vi.fn(() => 1).mockReturnValueOnce(1).mockReturnValueOnce(1).mockReturnValueOnce(0),
+    })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+  })
+
+  it('reports the denial when the identity process handle cannot be closed', () => {
+    // The token close (first) succeeds; the checked process-handle close (second)
+    // in the finally fails, so the heal aborts on the thrown Win32Error.
+    const { api, setNamedSecurityInfoW } = deniedLabelApi({
+      copySid: vi.fn(() => 1),
+      closeHandle: vi.fn(() => 1).mockReturnValueOnce(1).mockReturnValueOnce(1).mockReturnValueOnce(1).mockReturnValueOnce(0),
+    })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+  })
+})
+
+describe('healLabelAccess body failures', () => {
+  it('aborts the heal and fails closed when the re-read yields no DACL', () => {
+    const world = craftWorldSid()
+    const realDacl = craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true)
+    let readCalls = 0
+    const localFree = vi.fn(() => 0n as NativePtr)
+    const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>((_p: unknown, _t: unknown, info: number) =>
+      (info & abi.LABEL_SECURITY_INFORMATION) !== 0 ? abi.ERROR_ACCESS_DENIED : 0)
+    const api = aclApi({
+      setNamedSecurityInfoW,
+      getNamedSecurityInfoW: vi.fn((
+        _path: unknown, _type: unknown, _info: unknown, _owner: unknown, _group: unknown,
+        daclSlot: NativePtr, saclSlot: NativePtr, descriptorSlot: NativePtr,
+      ) => {
+        readCalls++
+        const dacl = readCalls === 1 ? realDacl : null
+        koffi.encode(daclSlot, PVOID, dacl === null ? 0n : ptrAddress(dacl))
+        koffi.encode(saclSlot, PVOID, 0n)
+        koffi.encode(descriptorSlot, PVOID, 6n)
+        return 0
+      }),
+      adjustTokenPrivileges: vi.fn(() => 0),
+      getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+      copySid: vi.fn(() => 1),
+      localFree,
+    })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    expect(caught).toBeInstanceOf(Win32Error)
+    expect((caught as Win32Error).win32Code).toBe(abi.ERROR_ACCESS_DENIED)
+    expect((caught as Error).message).toContain('self-heal was attempted and failed')
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
+    expect(localFree).toHaveBeenCalledWith(6n) // the descriptor freed on the no-DACL heal path
+    expect(readCalls).toBe(2)
+  })
+
+  it('aborts the heal when the WRITE_OWNER merge fails', () => {
+    const world = craftWorldSid()
+    let mergeCalls = 0
+    const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>((_p: unknown, _t: unknown, info: number) =>
+      (info & abi.LABEL_SECURITY_INFORMATION) !== 0 ? abi.ERROR_ACCESS_DENIED : 0)
+    const api = aclApi({
+      setNamedSecurityInfoW,
+      setEntriesInAclW: vi.fn((_count: unknown, _entries: Buffer, _old: unknown, newAcl: NativePtr) => {
+        mergeCalls++
+        if (mergeCalls === 1) {
+          koffi.encode(newAcl, PVOID, 9n)
+          return 0
+        }
+        return 1 // the heal's WRITE_OWNER merge fails
+      }),
+      // A null descriptor on the re-read: the heal's finally skips its descriptor free.
+      getNamedSecurityInfoW: readStub(craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true), null, null),
+      adjustTokenPrivileges: vi.fn(() => 0),
+      getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+      copySid: vi.fn(() => 1),
+    })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    expect(caught).toBeInstanceOf(Win32Error)
+    expect((caught as Win32Error).win32Code).toBe(abi.ERROR_ACCESS_DENIED)
+    expect((caught as Error).message).toContain('self-heal was attempted and failed')
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
+    expect(mergeCalls).toBe(2)
+  })
+
+  it('aborts the heal when the temporary WRITE_OWNER grant cannot be written', () => {
+    const world = craftWorldSid()
+    const results = [0, abi.ERROR_ACCESS_DENIED, abi.ERROR_ACCESS_DENIED]
+    const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => results.shift() ?? 0)
+    const api = aclApi({
+      setNamedSecurityInfoW,
+      getNamedSecurityInfoW: readStub(craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true), null, 6n),
+      adjustTokenPrivileges: vi.fn(() => 0),
+      getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+      copySid: vi.fn(() => 1),
+    })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    expect(caught).toBeInstanceOf(Win32Error)
+    expect((caught as Win32Error).win32Code).toBe(abi.ERROR_ACCESS_DENIED)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(3) // DACL, LABEL, failed WO grant (no retry, no restore)
+  })
+
+  it('warns (label applied) when the restore write fails but the retry succeeded', () => {
+    const world = craftWorldSid()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const results = [0, abi.ERROR_ACCESS_DENIED, 0, 0, abi.ERROR_ACCESS_DENIED]
+    const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => results.shift() ?? 0)
+    const api = aclApi({
+      setNamedSecurityInfoW,
+      getNamedSecurityInfoW: readStub(craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true), null, 6n),
+      adjustTokenPrivileges: vi.fn(() => 0),
+      getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+      copySid: vi.fn(() => 1),
+    })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid()
+    expect(() => { grantWrite(api, 'C:\\granted', sid, lowSid, world) }).not.toThrow()
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(5)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls.at(0)?.[0]).toContain('integrity label applied')
+    warn.mockRestore()
+  })
+
+  it('warns (label not applied) and fails closed when the retry and the restore both fail', () => {
+    const world = craftWorldSid()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const results = [0, abi.ERROR_ACCESS_DENIED, 0, abi.ERROR_ACCESS_DENIED, abi.ERROR_ACCESS_DENIED]
+    const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => results.shift() ?? 0)
+    const api = aclApi({
+      setNamedSecurityInfoW,
+      getNamedSecurityInfoW: readStub(craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true), null, 6n),
+      adjustTokenPrivileges: vi.fn(() => 0),
+      getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+      copySid: vi.fn(() => 1),
+    })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    expect(caught).toBeInstanceOf(Win32Error)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls.at(0)?.[0]).toContain('integrity label not applied')
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(5)
+    warn.mockRestore()
+  })
+})
+
+describe('mergeAndApply LocalFree-result checks', () => {
+  it('throws from the checked label-ACL LocalFree when the DACL step fails (grant)', () => {
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    const localFree = vi.fn(() => 1n as NativePtr) // every free reports a non-null handle
+    const api = aclApi({
+      setNamedSecurityInfoW: vi.fn((_p: unknown, _t: unknown, info: number) =>
+        (info & abi.DACL_SECURITY_INFORMATION) !== 0 ? abi.ERROR_ACCESS_DENIED : 0),
+      localFree,
+    })
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    expect(caught).toBeInstanceOf(Win32Error)
+    expect((caught as Win32Error).api).toBe('LocalFree')
+    expect(localFree).toHaveBeenCalledWith(11n) // the label ACL
+  })
+
+  it('throws from the checked descriptor LocalFree on the revoke keep path', () => {
+    const sid = craftSid(1, 0)
+    const foreignSid = craftSid(1, 0, [0, 0, 0, 0, 0, 7]) // a grant for a DIFFERENT sid: keeps the label
+    const oldAcl = craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, abi.GRANT_MASK, foreignSid, true)
+    const localFree = vi.fn((p: NativePtr) => (ptrAddress(p) === 6n ? (1n as NativePtr) : (0n as NativePtr)))
+    const api = aclApi({
+      getNamedSecurityInfoW: readStub(oldAcl, null, 6n),
+      localFree,
+      setNamedSecurityInfoW: vi.fn(() => 0), // the DACL step succeeds
+    })
+    let caught: unknown
+    try { revokeWrite(api, 'C:\\granted', sid) } catch (error) { caught = error }
+    expect(caught).toBeInstanceOf(Win32Error)
+    expect((caught as Win32Error).api).toBe('LocalFree')
+    expect(localFree).toHaveBeenCalledWith(6n)
+  })
+
+  it('throws from the checked descriptor LocalFree after a fully successful grant', () => {
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    const localFree = vi.fn((p: NativePtr) => (ptrAddress(p) === 6n ? (1n as NativePtr) : (0n as NativePtr)))
+    const api = aclApi({
+      getNamedSecurityInfoW: readStub(craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true), null, 6n),
+      localFree,
+      setNamedSecurityInfoW: vi.fn(() => 0), // DACL and LABEL both succeed
+      adjustTokenPrivileges: vi.fn(() => 0), // privilege disabled, but the LABEL still passes
+    })
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    expect(caught).toBeInstanceOf(Win32Error)
+    expect((caught as Win32Error).api).toBe('LocalFree')
+  })
+})
+
+describe('reportLabelFailure system-text detail', () => {
+  it('includes the formatted system text in the fail-closed message', () => {
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    const sysText = 'Access is denied.\n\n'
+    const formatMessageW = vi.fn((
+      _lang: unknown, _source: unknown, _code: number, _flags: unknown,
+      buffer: Buffer, _buflen: number, _args: unknown,
+    ) => {
+      buffer.write(sysText, 0, buffer.length / 2, 'utf16le')
+      return sysText.length // chars written, like the real FormatMessageW
+    })
+    const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>((_p: unknown, _t: unknown, info: number) =>
+      (info & abi.LABEL_SECURITY_INFORMATION) !== 0 ? abi.ERROR_ACCESS_DENIED : 0)
+    const api = aclApi({
+      setNamedSecurityInfoW,
+      adjustTokenPrivileges: vi.fn(() => 0),
+      getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+      formatMessageW,
+    })
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    expect(caught).toBeInstanceOf(Win32Error)
+    expect((caught as Error).message).toContain('Access is denied')
+    expect((caught as Error).message).toContain('Win32 5: Access is denied')
+  })
+})
+
+describe('mergeAndApply and heal remaining branch edges', () => {
+  it('skips the label-ACL free when the DACL step fails on a revoke (no label to own)', () => {
+    // A grant for the SAME sid being revoked is not a foreign grant, so the
+    // label edit is `clear` — there is no label ACL owned when the DACL step
+    // fails, and the checked free is skipped rather than leaking.
+    const sid = craftSid(1, 0)
+    const oldAcl = craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, abi.GRANT_MASK, sid, true)
+    const api = aclApi({
+      getNamedSecurityInfoW: readStub(oldAcl, null, 6n),
+      setNamedSecurityInfoW: vi.fn((_p: unknown, _t: unknown, info: number) =>
+        (info & abi.DACL_SECURITY_INFORMATION) !== 0 ? abi.ERROR_ACCESS_DENIED : 0),
+    })
+    let caught: unknown
+    try { revokeWrite(api, 'C:\\granted', sid) } catch (error) { caught = error }
+    expect(caught).toBeInstanceOf(Win32Error)
+    expect((caught as Win32Error).api).toBe('SetNamedSecurityInfoW')
+  })
+
+  it('aborts the heal without a descriptor free when the re-read yields no DACL or descriptor', () => {
+    const world = craftWorldSid()
+    const realDacl = craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true)
+    let readCalls = 0
+    const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>((_p: unknown, _t: unknown, info: number) =>
+      (info & abi.LABEL_SECURITY_INFORMATION) !== 0 ? abi.ERROR_ACCESS_DENIED : 0)
+    const api = aclApi({
+      setNamedSecurityInfoW,
+      getNamedSecurityInfoW: vi.fn((
+        _path: unknown, _type: unknown, _info: unknown, _owner: unknown, _group: unknown,
+        daclSlot: NativePtr, saclSlot: NativePtr, descriptorSlot: NativePtr,
+      ) => {
+        readCalls++
+        const dacl = readCalls === 1 ? realDacl : null
+        koffi.encode(daclSlot, PVOID, dacl === null ? 0n : ptrAddress(dacl))
+        koffi.encode(saclSlot, PVOID, 0n)
+        koffi.encode(descriptorSlot, PVOID, 0n) // null descriptor: no block to free
+        return 0
+      }),
+      adjustTokenPrivileges: vi.fn(() => 0),
+      getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+      copySid: vi.fn(() => 1),
+    })
+    const sid = craftSid(1, 0); const lowSid = craftLowLabelSid()
+    let caught: unknown
+    try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
+    expect(caught).toBeInstanceOf(Win32Error)
+    expect((caught as Win32Error).win32Code).toBe(abi.ERROR_ACCESS_DENIED)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
+    expect(readCalls).toBe(2)
   })
 })
