@@ -21,6 +21,13 @@ export const DELETE = 0x00010000
 /** Delete or rename a directory child. */
 export const FILE_DELETE_CHILD = 0x0040
 /**
+ * Change the owner of an object. The object-level right that authorizes the
+ * LABEL (SACL) write WITHOUT the SeRelabelPrivilege token privilege — the
+ * kernel accepts EITHER of the two. The owner already holds it implicitly, so
+ * a caller-owned directory gains nothing a caller did not already control.
+ */
+export const WRITE_OWNER = 0x00080000
+/**
  * Capability-SID access mask granting write, delete, and child deletion.
  * WRITE_DAC and WRITE_OWNER stay excluded so a confined child cannot rewrite
  * DACLs or take ownership to escape the allowlist.
@@ -36,6 +43,8 @@ export const LUA_TOKEN = 0x4
 export const WRITE_RESTRICTED = 0x8
 /** WELL_KNOWN_SID_TYPE value for Everyone. */
 export const WinWorldSid = 1
+/** TOKEN_INFORMATION_CLASS value for the token's user. */
+export const TokenUser = 1
 /** TOKEN_INFORMATION_CLASS value for token groups. */
 export const TokenGroups = 2
 /** TOKEN_INFORMATION_CLASS value for the token's privilege set. */
@@ -109,6 +118,8 @@ export const CONTAINER_INHERIT_ACE = 0x2
 export const MAX_PATH = 260
 /** Successful Win32 status code. */
 export const ERROR_SUCCESS = 0
+/** Win32 error reported when the requested access is denied. */
+export const ERROR_ACCESS_DENIED = 5
 /** Win32 error reported when an immediate byte-range lock cannot be obtained. */
 export const ERROR_LOCK_VIOLATION = 33
 /** Win32 error reported when a token privilege could not be enabled (the privilege exists but is not held with the enabling bit). */

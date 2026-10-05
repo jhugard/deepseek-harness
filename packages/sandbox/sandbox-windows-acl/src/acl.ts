@@ -10,13 +10,22 @@
  * DACL-only call ({@link abi.DACL_SECURITY_INFORMATION}); the Low no-write-up
  * mandatory label ({@link buildLowLabelAcl}) goes out second in a
  * LABEL-only call ({@link abi.LABEL_SECURITY_INFORMATION}) after the
- * SeRelabelPrivilege enable ({@link ensureRelabelPrivilege}). The kernel
+ * SeRelabelPrivilege attempt ({@link ensureRelabelPrivilege}). The kernel
  * evaluates every requested information class up front, so a combined
- * DACL|LABEL call by a token without the privilege fails wholesale with
- * ERROR_ACCESS_DENIED — losing even the DACL grant and crashing the
- * workspace binding. Decoupled, the DACL step succeeds under the owner's
- * implicit WRITE_DAC and a label failure degrades to a diagnostic instead of
- * a throw. The deny is what keeps one granted root out of another's reach:
+ * DACL|LABEL call by a token without what the label write needs fails
+ * wholesale with ERROR_ACCESS_DENIED — losing even the DACL grant and
+ * crashing the workspace binding. Decoupled, the DACL step succeeds under
+ * the owner's implicit WRITE_DAC, and the label write goes out regardless
+ * of whether the privilege is held: the kernel accepts EITHER
+ * SeRelabelPrivilege OR the WRITE_OWNER right on the directory. When the
+ * label write is still denied without the privilege, the grant self-heals
+ * once — grant the caller's own user SID WRITE_OWNER on the directory (the
+ * owner-implicit WRITE_DAC authorizes it), retry the label, and revoke the
+ * temporary right — so adding a workspace to a workspace-write session
+ * needs no elevation and no manual icacls step. A label that cannot be
+ * written even after the heal throws: the DACL grant alone leaves the
+ * child able to write UP into Medium-IL targets, so the workspace is not
+ * usable without the label. The deny is what keeps one granted root out of another's reach:
  * Windows also authorizes a delete from the parent directory's
  * `FILE_DELETE_CHILD` right, which the token's write-restricted intersection
  * does not reach, and every granted root carries the Low label that clears
@@ -35,7 +44,7 @@ import { dirname, join } from 'node:path'
 
 import { Win32Error } from '@deepseek-ai/dsh-win32-process'
 
-import { allocOverlapped, allocPtrSlot, allocUint32, decodePtr, decodeUint8At, decodeUint16At, decodeUint32, decodeUint32At, getTempPath, isInvalidHandle, isNullPtr, ptrAddress, sameSidAt, throwLastError, throwWin32 } from './ffi.ts'
+import { allocOverlapped, allocPtrSlot, allocUint32, decodePtr, decodePtrAt, decodeUint8At, decodeUint16At, decodeUint32, decodeUint32At, getTempPath, isInvalidHandle, isNullPtr, ptrAddress, sameSidAt, throwLastError, throwWin32 } from './ffi.ts'
 import type { NativePtr, Win32Bindings } from './ffi.ts'
 import * as abi from './win32-abi.ts'
 
@@ -225,15 +234,18 @@ type LabelEdit = { kind: 'apply'; acl: NativePtr } | { kind: 'clear' } | { kind:
  * (null = no explicit DACL yet; SetEntriesInAclW builds one from scratch),
  * free the descriptor, then apply the edits in two SetNamedSecurityInfoW
  * calls — the merged DACL ALONE (owner-implicit WRITE_DAC suffices), then the
- * label edit ALONE after the SeRelabelPrivilege enable ({@link
- * ensureRelabelPrivilege}) — freeing every ACL this operation owns and
- * reporting each failure with the caller's label and the step's context
- * (`DACL step` / `LABEL step`). A combined DACL|LABEL call would fail
- * wholesale with ERROR_ACCESS_DENIED whenever the token lacks the privilege,
- * losing even the DACL grant; the split keeps the grant live when the label
- * cannot be written (the label step then degrades to a diagnostic instead of
- * a throw). The entry count derives from the buffer, so a grant can carry its
- * capability ACE and its ambient-delete deny in one merge.
+ * label edit ALONE, attempted regardless of whether the SeRelabelPrivilege
+ * enable succeeded ({@link ensureRelabelPrivilege}) — freeing every ACL this
+ * operation owns and reporting each failure with the caller's label and the
+ * step's context (`DACL step` / `LABEL step`). A combined DACL|LABEL call
+ * would fail wholesale with ERROR_ACCESS_DENIED whenever the token lacks
+ * what the label write needs, losing even the DACL grant. The label goes
+ * out even without the privilege because the kernel accepts EITHER the
+ * privilege OR WRITE_OWNER on the directory (the {@link healLabelAccess}
+ * self-heal grants the caller's own WRITE_OWNER when the first attempt is
+ * denied); only a label that fails after the heal is a failure. The entry
+ * count derives from the buffer, so a grant can carry its capability ACE and
+ * its ambient-delete deny in one merge.
  * @param api - the binding table.
  * @param path - the directory the DACL and label edits apply to.
  * @param entries - packed EXPLICIT_ACCESS_W records to merge (grant, deny, or revoke).
@@ -298,30 +310,41 @@ function mergeAndApply(
     return
   }
 
-  // Step B: enable the SeRelabelPrivilege the SACL write requires. Failing
-  // here is a label-degrade, not a grant failure: the DACL grant stands, so
-  // the workspace binding stays live and the child runs without the
-  // integrity protection.
+  // Step B: enable the SeRelabelPrivilege the SACL write can use. The LABEL
+  // goes out EITHER WAY: the kernel accepts the label write when the caller
+  // holds the privilege OR the WRITE_OWNER right on the directory (the owner
+  // holds WRITE_OWNER implicitly, and an inherited Full/Modify ACE carries
+  // it), so an unprivileged caller frequently labels the root cleanly on the
+  // first attempt. When that attempt is denied anyway, Step C' self-heals.
   const privilege = ensureRelabelPrivilege(api, `${label}(${path}) label step`)
-  if (privilege.enabled === false) {
-    freeLabelIfOwned(api, labelEdit, `${label}(${path})`)
-    if (freedDescriptor !== null && !isNullPtr(freedDescriptor)) throwLastError(api, 'LocalFree', `${label}(${path}) descriptor`)
-    reportLabelDegrade(path, label, privilege.reason)
-    return
-  }
 
   // Step C: the LABEL edit goes out ALONE — `apply` sets the Low no-write-up
   // ACE, `clear` replaces the SACL with a NULL pointer (removes every label
-  // ACE).
-  const labelResult = api.setNamedSecurityInfoW(
-    path, abi.SE_FILE_OBJECT, abi.LABEL_SECURITY_INFORMATION, null, null, null,
-    labelEdit.kind === 'apply' ? labelEdit.acl : null,
+  // ACE). The label is not optional: a DACL-only grant would leave the child
+  // able to write UP into Medium-IL targets outside the roots, so a label
+  // that cannot be written (even after the heal) throws fail-closed — the
+  // caller's init() must not report a workspace the confined child cannot
+  // safely use.
+  const labelSacl = labelEdit.kind === 'apply' ? labelEdit.acl : null
+  let labelResult = api.setNamedSecurityInfoW(
+    path, abi.SE_FILE_OBJECT, abi.LABEL_SECURITY_INFORMATION, null, null, null, labelSacl,
   )
+  if (labelResult !== abi.ERROR_SUCCESS) {
+    // One self-heal pass on an access denial: grant the caller's own
+    // WRITE_OWNER on the directory (the owner-implicit WRITE_DAC authorizes
+    // the DACL edit), retry the label once, then restore the pre-heal DACL
+    // from the snapshot taken before the merge.
+    // Never skip the label because the privilege is absent — the privilege
+    // was never the only gate, and a skipped label silently disables the
+    // integrity confinement while reporting success.
+    if (!privilege.enabled && labelResult === abi.ERROR_ACCESS_DENIED) {
+      labelResult = healLabelAccess(api, path, labelSacl, labelResult)
+    }
+  }
   freeLabelIfOwned(api, labelEdit, `${label}(${path})`)
   if (labelResult !== abi.ERROR_SUCCESS) {
-    // The privilege was held and enabled yet the write still failed — report
-    // the exact code plus the diagnostic trail and let the caller's
-    // fail-closed semantics decide the outcome.
+    // The write failed even after the heal — report the exact code plus the
+    // diagnostic trail and let the caller's fail-closed semantics decide.
     reportLabelFailure(api, path, label, labelResult, privilege)
   }
   if (freedDescriptor !== null && !isNullPtr(freedDescriptor)) throwLastError(api, 'LocalFree', `${label}(${path}) descriptor`)
@@ -354,9 +377,10 @@ function privilegeMessage(api: Win32Bindings, code: number): string {
  * set, and enables the single privilege through AdjustTokenPrivileges.
  *
  * Non-throwing by contract: every failure returns `{ enabled: false }` with
- * the reason, because the caller has already applied the DACL grant and must
- * degrade the label — not fail the workspace binding. The token and process
- * handles are always closed, including on the failure paths.
+ * the reason. The caller does NOT skip the label on that outcome — the LABEL
+ * write goes out anyway (it can pass on the object WRITE_OWNER right) and is
+ * self-healed when the denial says the privilege is genuinely absent. The
+ * token and process handles are always closed, including on the failure paths.
  * @param api - the binding table.
  * @param context - the caller's name for error details.
  * @returns the enable outcome (never throws).
@@ -367,7 +391,7 @@ export function ensureRelabelPrivilege(api: Win32Bindings, context: string): Rel
   try {
     processHandle = api.openProcess(abi.PROCESS_QUERY_INFORMATION, 0, process.pid)
     if (isNullPtr(processHandle)) {
-      return { enabled: false, reason: `OpenProcess failed (Win32 ${api.getLastError()}) for pid ${process.pid}; the privilege cannot be enabled and the integrity label is skipped` }
+      return { enabled: false, reason: `OpenProcess failed (Win32 ${api.getLastError()}) for pid ${process.pid}; the privilege cannot be enabled (the LABEL write is attempted anyway and may pass on the object WRITE_OWNER right)` }
     }
     const tokenSlot = allocPtrSlot()
     const opened = api.openProcessToken(
@@ -375,11 +399,11 @@ export function ensureRelabelPrivilege(api: Win32Bindings, context: string): Rel
     )
     if (opened === 0) {
       const code = api.getLastError()
-      return { enabled: false, reason: `OpenProcessToken failed (Win32 ${code}: ${privilegeMessage(api, code)}) for pid ${process.pid}; the privilege cannot be enabled and the integrity label is skipped` }
+      return { enabled: false, reason: `OpenProcessToken failed (Win32 ${code}: ${privilegeMessage(api, code)}) for pid ${process.pid}; the privilege cannot be enabled (the LABEL write is attempted anyway and may pass on the object WRITE_OWNER right)` }
     }
     token = decodePtr(tokenSlot)
     if (token === null) {
-      return { enabled: false, reason: `OpenProcessToken returned a null token handle (Win32 ${api.getLastError()}); the privilege cannot be enabled and the integrity label is skipped` }
+      return { enabled: false, reason: `OpenProcessToken returned a null token handle (Win32 ${api.getLastError()}); the privilege cannot be enabled (the LABEL write is attempted anyway and may pass on the object WRITE_OWNER right)` }
     }
     if (api.closeHandle(processHandle) === 0) throwLastError(api, 'CloseHandle', 'OpenProcess process handle (privilege enable)')
     processHandle = null
@@ -389,7 +413,7 @@ export function ensureRelabelPrivilege(api: Win32Bindings, context: string): Rel
     api.getTokenInformation(token, abi.TokenPrivileges, null, 0, neededSlot)
     const needed = decodeUint32(neededSlot)
     if (needed === 0) {
-      return { enabled: false, reason: `GetTokenInformation(TokenPrivileges) size query returned zero (Win32 ${api.getLastError()}); the privilege cannot be enabled and the integrity label is skipped` }
+      return { enabled: false, reason: `GetTokenInformation(TokenPrivileges) size query returned zero (Win32 ${api.getLastError()}); the privilege cannot be enabled (the LABEL write is attempted anyway and may pass on the object WRITE_OWNER right)` }
     }
     if (needed < 8) {
       return { enabled: false, reason: `implausible TokenPrivileges size ${needed}` }
@@ -397,7 +421,7 @@ export function ensureRelabelPrivilege(api: Win32Bindings, context: string): Rel
     const privileges = Buffer.alloc(needed)
     if (api.getTokenInformation(token, abi.TokenPrivileges, privileges, privileges.length, neededSlot) === 0) {
       const code = api.getLastError()
-      return { enabled: false, reason: `GetTokenInformation(TokenPrivileges) failed (Win32 ${code}: ${privilegeMessage(api, code)}); the privilege cannot be enabled and the integrity label is skipped` }
+      return { enabled: false, reason: `GetTokenInformation(TokenPrivileges) failed (Win32 ${code}: ${privilegeMessage(api, code)}); the privilege cannot be enabled (the LABEL write is attempted anyway and may pass on the object WRITE_OWNER right)` }
     }
 
     // The LUID is an 8-byte value the caller reads back after the lookup — a
@@ -405,7 +429,7 @@ export function ensureRelabelPrivilege(api: Win32Bindings, context: string): Rel
     const luid = Buffer.alloc(8)
     if (api.lookupPrivilegeValueW(null, abi.SE_RELABEL_NAME, luid) === 0) {
       const code = api.getLastError()
-      return { enabled: false, reason: `LookupPrivilegeValueW(${abi.SE_RELABEL_NAME}) failed (Win32 ${code}: ${privilegeMessage(api, code)}); the privilege cannot be enabled and the integrity label is skipped` }
+      return { enabled: false, reason: `LookupPrivilegeValueW(${abi.SE_RELABEL_NAME}) failed (Win32 ${code}: ${privilegeMessage(api, code)}); the privilege cannot be enabled (the LABEL write is attempted anyway and may pass on the object WRITE_OWNER right)` }
     }
     // x64 TOKEN_PRIVILEGES holding a single entry: PrivilegeCount@0 (DWORD),
     // then one LUID_AND_ATTRIBUTES (Luid@4, Attributes@12; the entry is 12
@@ -419,29 +443,37 @@ export function ensureRelabelPrivilege(api: Win32Bindings, context: string): Rel
     luid.copy(newState, 4)
     newState.writeUInt32LE(abi.SE_PRIVILEGE_ENABLED, 12)
     const returnLength = allocUint32()
-    // The BOOL return is the success signal (Win32 contract); GetLastError is
-    // consulted ONLY on failure to name 1300/1301.
+    // AdjustTokenPrivileges returns TRUE even when the privilege is NOT in the
+    // token: it then leaves GetLastError at ERROR_NOT_ALL_ASSIGNED (1300).
+    // GetLastError MUST therefore be read on the success path too — treating
+    // the BOOL alone as the success signal reports a privilege the caller
+    // never got, which is how a missing SeRelabelPrivilege used to masquerade
+    // as "enabled" while the LABEL write went out and failed.
     const adjusted = api.adjustTokenPrivileges(token, 0, newState, newState.length, null, returnLength)
+    const adjustCode = api.getLastError()
+    if (adjusted !== 0 && adjustCode === abi.ERROR_NOT_ALL_ASSIGNED) {
+      return { enabled: false, reason: `AdjustTokenPrivileges(${abi.SE_RELABEL_NAME}) left the privilege unassigned (Win32 ${adjustCode}: ${privilegeMessage(api, adjustCode)}) — the current token does not hold ${abi.SE_RELABEL_NAME}` }
+    }
     if (adjusted !== 0) {
       return { enabled: true, reason: '' }
     }
-    const code = api.getLastError()
+    const code = adjustCode
     const detail = code === abi.ERROR_NOT_ALL_ASSIGNED
       ? `Win32 ${code}: ${privilegeMessage(api, code)} — the token holds ${abi.SE_RELABEL_NAME} but could not enable it; run DSH elevated (an elevated token carries the privilege enabled) or grant the principal the privilege, then retry`
       : code === abi.ERROR_NO_SUCH_PRIVILEGE
         ? `Win32 ${code}: ${privilegeMessage(api, code)} — the token does not hold ${abi.SE_RELABEL_NAME}; run DSH elevated (an elevated token carries the privilege enabled) or grant the principal the privilege, then retry`
         : `Win32 ${code}: ${privilegeMessage(api, code)}`
-    return { enabled: false, reason: `AdjustTokenPrivileges(${abi.SE_RELABEL_NAME}) failed (${detail}); the integrity label is skipped` }
+    return { enabled: false, reason: `AdjustTokenPrivileges(${abi.SE_RELABEL_NAME}) failed (${detail})` }
   } catch (error) {
     // Defensive: a missing binding in a partial stub (or any thrown call)
-    // degrades the label instead of failing the grant — the DACL is already
-    // applied and must survive.
+    // reports the privilege as unavailable; the caller still attempts the
+    // LABEL write (and self-heals a denial) rather than failing the grant here.
     const detail = error instanceof Win32Error
       ? `${error.api} failed (Win32 ${error.win32Code})`
       : error instanceof Error
         ? error.message
         : String(error)
-    return { enabled: false, reason: `${context} privilege enable failed (${detail}); the integrity label is skipped` }
+    return { enabled: false, reason: `${context} privilege enable failed (${detail})` }
   } finally {
     if (processHandle !== null) api.closeHandle(processHandle) // best-effort on the error paths
     if (token !== null) api.closeHandle(token)
@@ -457,32 +489,157 @@ function freeLabelIfOwned(api: Win32Bindings, labelEdit: LabelEdit, context: str
 }
 
 /**
- * Report a degraded label: the DACL grant was applied, the integrity label
- * was not, and the workspace binding stays live. One descriptive line carries
- * the privilege-enable failure and the remediation — the caller (and a human
- * triaging the workspace) sees exactly which step failed and why.
- * @param path - the directory the grant was applied to.
- * @param label - the caller's name (grantWrite/revokeWrite).
- * @param reason - the privilege-enable failure from {@link ensureRelabelPrivilege}.
+ * Read the CALLER's user SID (TokenUser) as a LocalAlloc'd copy the caller
+ * frees with LocalFree. Used by {@link healLabelAccess} to name the calling
+ * principal in a temporary WRITE_OWNER ACE. Throws on any failure — the
+ * caller turns that into the original label error, never a silent degrade.
+ * @param api - the binding table.
+ * @returns a copied user SID (LocalFree-allocated; caller frees).
  */
-function reportLabelDegrade(path: string, label: string, reason: string): void {
+function readCallerUserSid(api: Win32Bindings): NativePtr {
+  const processHandle = api.openProcess(abi.PROCESS_QUERY_INFORMATION, 0, process.pid)
+  if (isNullPtr(processHandle)) throwLastError(api, 'OpenProcess', 'caller user SID')
+  const tokenSlot = allocPtrSlot()
+  const opened = api.openProcessToken(processHandle, abi.TOKEN_QUERY, tokenSlot)
+  if (opened === 0) {
+    api.closeHandle(processHandle) // best-effort on the failure path
+    throwLastError(api, 'OpenProcessToken', 'caller user SID')
+  }
+  const token = decodePtr(tokenSlot)
+  if (token === null) {
+    api.closeHandle(processHandle)
+    throwWin32(api, 'OpenProcessToken', api.getLastError(), 'null token handle (caller user SID)')
+  }
   try {
-    // `reason` names the privilege the token could not enable; the SACL write
-    // additionally needs the WRITE_OWNER right on the directory (the object
-    // level icacls can grant), so the warning names both and gives the remedy.
-    console.warn(`[dsh-sandbox-windows-acl] ${label}(${path}) integrity label not applied: ${reason}. The label lives in the SACL, so applying it also needs WRITE_OWNER on the directory — run DSH elevated (for the privilege) and, if the directory lacks it, run icacls "${path}" /grant %USERNAME%:(OI)(CI)(WO); the workspace binding stays live without the label`)
+    // Size query (expected to fail with ERROR_INSUFFICIENT_BUFFER) + read.
+    const neededSlot = allocUint32()
+    api.getTokenInformation(token, abi.TokenUser, null, 0, neededSlot)
+    const needed = decodeUint32(neededSlot)
+    if (needed < 8) throwWin32(api, 'GetTokenInformation', api.getLastError(), `implausible TokenUser size ${needed}`)
+    const user = Buffer.alloc(needed)
+    if (api.getTokenInformation(token, abi.TokenUser, user, user.length, neededSlot) === 0) {
+      throwLastError(api, 'GetTokenInformation', 'TokenUser')
+    }
+    // x64 TOKEN_USER: the SID pointer is the first field (SID_AND_ATTRIBUTES.Sid).
+    const sidPtr = decodePtrAt(user, 0)
+    if (sidPtr === null) throwWin32(api, 'GetTokenInformation', api.getLastError(), 'TokenUser returned a null SID')
+    const sidLength = api.getLengthSid(sidPtr)
+    if (sidLength === 0) throwLastError(api, 'GetLengthSid', 'caller user SID')
+    const copy = api.localAlloc(abi.LPTR, sidLength)
+    if (isNullPtr(copy)) throwLastError(api, 'LocalAlloc', 'caller user SID')
+    if (api.copySid(sidLength, copy, sidPtr) === 0) {
+      api.localFree(copy) // best-effort on the failure path
+      throwLastError(api, 'CopySid', 'caller user SID')
+    }
+    return copy
+  } finally {
+    if (api.closeHandle(token) === 0) throwLastError(api, 'CloseHandle', 'token handle (caller user SID)')
+    if (api.closeHandle(processHandle) === 0) throwLastError(api, 'CloseHandle', 'process handle (caller user SID)')
+  }
+}
+
+/**
+ * Grant the caller a temporary {@link abi.WRITE_OWNER} right on `path`, retry
+ * the LABEL write once, then restore the directory's DACL to EXACTLY the
+ * snapshot taken before the grant. This is the self-heal that makes
+ * `Workspace Write` work non-elevated on a directory whose DACL grants the
+ * caller Modify (not Full) and that carries no SeRelabelPrivilege: the kernel
+ * accepts EITHER the privilege OR object WRITE_OWNER for a SACL write, and
+ * the caller's owner-implicit WRITE_DAC authorizes the DACL edit that adds
+ * the right.
+ *
+ * Restore-by-snapshot (not grant-then-REVOKE): a {@link abi.REVOKE_ACCESS}
+ * merge on the same trustee the grant consolidated onto has
+ * undefined-by-specification behaviour, and on a real Modify ACE it drops the
+ * WHOLE ACE — the caller would silently lose their own right. Re-writing the
+ * verbatim pre-heal ACL is the same recovery the diagnosis repair performs and
+ * leaves the caller's ACEs byte-for-byte intact. The `OldAcl` from the read
+ * feeds the grant merge AND the restore (SetEntriesInAclW copies it, never
+ * consumes it), so the descriptor stays alive until both writes are done.
+ *
+ * NOT a security concession: the caller's own user SID (not the agent's
+ * capability SID) is named; {@link abi.WRITE_OWNER} never enters
+ * {@link abi.GRANT_MASK}; and the right exists only between the grant and the
+ * restore inside this one call.
+ * @param api - the binding table.
+ * @param path - the directory the label write targets.
+ * @param labelSacl - the SACL pointer the label write carries (null = clear).
+ * @param firstResult - the original label failure code, returned on any heal-step failure.
+ * @returns the retry's SetNamedSecurityInfoW code (or `firstResult`).
+ */
+function healLabelAccess(
+  api: Win32Bindings,
+  path: string,
+  labelSacl: NativePtr | null,
+  firstResult: number,
+): number {
+  let selfSid: NativePtr | null = null
+  try {
+    selfSid = readCallerUserSid(api)
   } catch {
-    // Warnings are best-effort; a broken console must not surface as a failure.
+    // A heal that cannot even read the caller's identity leaves the original
+    // diagnostic untouched: reportLabelFailure names the true gate.
+    return firstResult
+  }
+  const { oldAcl, descriptor } = readCurrentSecurity(api, path)
+  if (oldAcl === null) {
+    if (descriptor !== null) api.localFree(descriptor)
+    api.localFree(selfSid) // already read: the identity SID must not leak
+    return firstResult // no DACL to grant the temporary right onto
+  }
+  // Snapshot semantics: `oldAcl` points into `descriptor` and stays valid
+  // until the descriptor is freed at the very end — SetEntriesInAclW only
+  // reads it, so it doubles as the grant merge's base and the restore source.
+  let retryResult = firstResult
+  let granted = false
+  try {
+    const aclSlot = allocPtrSlot()
+    // Inheritance 0: the label write targets the root object itself, so the
+    // temporary right never touches the child tree (no inheritable ACE means
+    // no propagation walk on either the grant or the restore write).
+    const mergeResult = api.setEntriesInAclW(
+      1, buildExplicitAccess(selfSid, abi.GRANT_ACCESS, abi.WRITE_OWNER, 0), oldAcl, aclSlot,
+    )
+    const mergedAcl = mergeResult === abi.ERROR_SUCCESS ? decodePtr(aclSlot) : null
+    if (mergedAcl === null) return firstResult // grant merge failed: nothing written
+    try {
+      granted = api.setNamedSecurityInfoW(
+        path, abi.SE_FILE_OBJECT, abi.DACL_SECURITY_INFORMATION, null, null, mergedAcl, null,
+      ) === abi.ERROR_SUCCESS
+    } finally {
+      api.localFree(mergedAcl) // best-effort; the merged block is transient
+    }
+    if (!granted) return firstResult // could not apply WO: retry would hit the same denial
+    retryResult = api.setNamedSecurityInfoW(
+      path, abi.SE_FILE_OBJECT, abi.LABEL_SECURITY_INFORMATION, null, null, null, labelSacl,
+    )
+    return retryResult
+  } finally {
+    // Restore the pre-heal DACL verbatim, but only when the grant actually
+    // reached the disk — otherwise the DACL never changed and a rewrite would
+    // cost a propagation walk for nothing. The restored ACL no longer names
+    // the WO grant, so the caller's own ACEs are exactly as they were.
+    if (granted && api.setNamedSecurityInfoW(
+      path, abi.SE_FILE_OBJECT, abi.DACL_SECURITY_INFORMATION, null, null, oldAcl, null,
+    ) !== abi.ERROR_SUCCESS) {
+      console.warn(`[dsh-sandbox-windows-acl] ${path}: heal could not restore the pre-grant DACL (integrity label ${retryResult === abi.ERROR_SUCCESS ? 'applied' : 'not applied'})`)
+    }
+    if (descriptor !== null) api.localFree(descriptor) // frees oldAcl (it lives inside the descriptor)
+    api.localFree(selfSid) // best-effort
   }
 }
 
 /**
  * Report a failed LABEL-step SetNamedSecurityInfoW with the full diagnostic
  * trail (the exact Win32 code, the system text, and the privilege state that
- * preceded it). THROWS: unlike {@link reportLabelDegrade}, the privilege was
- * enabled yet the write was still denied — a state that needs the caller's
- * fail-closed handling (the DACL grant has already been applied and left in
- * place).
+ * preceded it). THROWS fail-closed: the write still failed AFTER the
+ * {@link healLabelAccess} self-heal, so neither the privilege nor
+ * the object WRITE_OWNER path could write the label — the workspace is NOT
+ * usable (a DACL-only grant leaves the Low child able to write UP into
+ * Medium-IL targets outside the granted roots) and the DACL half must not
+ * be reported as success. The message names the true gate: an ACL the
+ * caller cannot edit at all (a foreign/TrustedInstaller-owned root) or a
+ * filesystem that cannot store the label.
  * @param api - the binding table.
  * @param path - the directory the label write targeted.
  * @param label - the caller's name (grantWrite/revokeWrite).
@@ -499,9 +656,10 @@ function reportLabelFailure(
 ): never {
   const message = privilegeMessage(api, win32Code)
   const detail = `${label}(${path}) LABEL step (DACL grant applied; integrity label NOT applied) — `
-    + `privilege enable: ${privilege.reason || 'SeRelabelPrivilege enabled'}; `
+    + `privilege: ${privilege.enabled ? 'SeRelabelPrivilege enabled' : privilege.reason}; `
     + `Win32 ${win32Code}${message === '' ? '' : `: ${message}`} — `
-    + `the SACL write needs the SeRelabelPrivilege token privilege AND the WRITE_OWNER right on the directory: run DSH elevated and icacls "${path}" /grant %USERNAME%:(OI)(CI)(WO), then re-provision the workspace`
+    + 'the SACL write needs the SeRelabelPrivilege privilege OR the WRITE_OWNER right on the directory; the WRITE_OWNER self-heal was attempted and failed. '
+    + `The current user cannot edit this directory's ACL: pick a directory you own, or grant WRITE_OWNER with icacls "${path}" /grant %USERNAME%:(OI)(CI)(WO), then retry.`
   throw new Win32Error('SetNamedSecurityInfoW', win32Code, detail)
 }
 
@@ -608,9 +766,12 @@ function hasForeignGrant(oldAcl: NativePtr, sidPtr: NativePtr): boolean {
  * large workspaces). Otherwise read-merge-write, so pre-existing explicit ACEs
  * survive (same shape as {@link revokeWrite}). Runs under the per-path lock.
  * The directory must be owned by the caller (owner-implicit WRITE_DAC covers
- * the DACL step). The LABEL step additionally needs SeRelabelPrivilege (the
- * SACL write): when the privilege cannot be enabled the label degrades to a
- * diagnostic warning and the DACL grant — the workspace binding — stands.
+ * the DACL step). The LABEL step needs SeRelabelPrivilege OR WRITE_OWNER on
+ * the directory: when the first label write is denied and the privilege is
+ * absent, the grant self-heals once ({@link healLabelAccess}) by temporarily
+ * granting the caller's own WRITE_OWNER; a label that still cannot be
+ * written throws, so init() never reports a workspace whose integrity
+ * protection is missing.
  * @param api - the binding table.
  * @param path - the directory whose DACL and label gain the grant (the workspace or temp root).
  * @param sidPtr - the capability SID the ACE names.
