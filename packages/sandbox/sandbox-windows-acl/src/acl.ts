@@ -5,27 +5,35 @@
  * failure is reported with the API name, the exact Win32 code, the formatted
  * system text, and the affected path.
  *
- * Each grant applies three edits in TWO SetNamedSecurityInfoW calls: the
- * capability-SID allow ACE plus the ambient-delete Deny ACE go out first in a
- * DACL-only call ({@link abi.DACL_SECURITY_INFORMATION}); the Low no-write-up
- * mandatory label ({@link buildLowLabelAcl}) goes out second in a
- * LABEL-only call ({@link abi.LABEL_SECURITY_INFORMATION}) after the
- * SeRelabelPrivilege attempt ({@link ensureRelabelPrivilege}). The kernel
- * evaluates every requested information class up front, so a combined
- * DACL|LABEL call by a token without what the label write needs fails
- * wholesale with ERROR_ACCESS_DENIED — losing even the DACL grant and
- * crashing the workspace binding. Decoupled, the DACL step succeeds under
- * the owner's implicit WRITE_DAC, and the label write goes out regardless
- * of whether the privilege is held: the kernel accepts EITHER
- * SeRelabelPrivilege OR the WRITE_OWNER right on the directory. When the
- * label write is still denied without the privilege, the grant self-heals
- * once — grant the caller's own user SID WRITE_OWNER on the directory (the
- * owner-implicit WRITE_DAC authorizes it), retry the label, and revoke the
- * temporary right — so adding a workspace to a workspace-write session
- * needs no elevation and no manual icacls step. A label that cannot be
- * written even after the heal throws: the DACL grant alone leaves the
- * child able to write UP into Medium-IL targets, so the workspace is not
- * usable without the label. The deny is what keeps one granted root out of another's reach:
+ * Each grant applies three edits, the DACL pair first in a DACL-only call
+ * ({@link abi.DACL_SECURITY_INFORMATION}) and the Low no-write-up mandatory
+ * label ({@link buildLowLabelAcl}) second in a LABEL-only call
+ * ({@link abi.LABEL_SECURITY_INFORMATION}); a combined DACL|LABEL call is not
+ * an option because the kernel evaluates every requested information class up
+ * front — a token without what the label write needs fails the whole call with
+ * ERROR_ACCESS_DENIED, losing even the DACL grant and crashing the workspace
+ * binding. Decoupled, the DACL step succeeds under the owner's implicit
+ * WRITE_DAC. The label write needs EITHER SeRelabelPrivilege
+ * ({@link ensureRelabelPrivilege}) OR the WRITE_OWNER right — and, for the
+ * eager inheritance walk, needs it on EACH CHILD, not just on the directory
+ * the write names. Ownership implies WRITE_DAC but NOT WRITE_OWNER, so a plain
+ * label write on a non-privileged host stamps the root and silently skips
+ * every child the caller cannot relabel — while reporting ERROR_SUCCESS —
+ * leaving a half-granted workspace: root labelled, pre-existing children
+ * label-free (so effectively Medium), confined writes inside denied like a
+ * DACL problem. Without the privilege the label therefore goes out through
+ * {@link healLabelAccess}: a momentary {@link abi.SUB_CONTAINERS_AND_OBJECTS_INHERIT}
+ * WRITE_OWNER for the caller's own SID, the label write, then the verbatim
+ * DACL restore — one walk labels the whole tree, pre-existing files included
+ * (a file cannot carry the label on its own; the (OI) inheritance is what puts
+ * it there). Each of these writes carries its own eager walk, measured at ~120
+ * microseconds per object, so adding a workspace takes a moment on a large
+ * tree and the assist says so before it starts. The exact standing ACEs, deny,
+ * and label still skip the walk on later sessions. So adding a workspace to a
+ * workspace-write session needs no elevation and no manual icacls step. A
+ * label that cannot be written even through the assist throws: the DACL grant
+ * alone leaves the child able to write UP into Medium-IL targets, so the
+ * workspace is not usable without the label. The deny is what keeps one granted root out of another's reach:
  * Windows also authorizes a delete from the parent directory's
  * `FILE_DELETE_CHILD` right, which the token's write-restricted intersection
  * does not reach, and every granted root carries the Low label that clears
@@ -209,7 +217,14 @@ export function buildLowLabelAcl(api: Win32Bindings, lowLabelSidPtr: NativePtr):
 /**
  * True when the label ACL already carries the EXACT label this module would
  * add (mandatory-label ACE, OI|CI inheritance, no-write-up policy, the Low
- * SID), so a re-grant can skip the eager full-tree propagation.
+ * SID), so a re-grant can skip the eager full-tree propagation. Only the root
+ * is examined: a completed grant — privileged, or written through the
+ * (OI|CI)-assist — stamped every child at grant time, and the label ACE's
+ * inheritance covers children created after that, so the root is a sound
+ * witness. The exception is a workspace granted by the PRE-assist code, when
+ * an unprivileged label write stamped the root but silently skipped the
+ * children; that half state passes this check and stands until the diagnosis
+ * repair runs on the workspace or on the child whose write still fails.
  * @param labelAcl - the current label ACL pointer (from {@link readCurrentSecurity}).
  * @param lowLabelSidPtr - the Low integrity SID to match.
  * @returns whether the exact label ACE is already present.
@@ -239,13 +254,13 @@ type LabelEdit = { kind: 'apply'; acl: NativePtr } | { kind: 'clear' } | { kind:
  * operation owns and reporting each failure with the caller's label and the
  * step's context (`DACL step` / `LABEL step`). A combined DACL|LABEL call
  * would fail wholesale with ERROR_ACCESS_DENIED whenever the token lacks
- * what the label write needs, losing even the DACL grant. The label goes
- * out even without the privilege because the kernel accepts EITHER the
- * privilege OR WRITE_OWNER on the directory (the {@link healLabelAccess}
- * self-heal grants the caller's own WRITE_OWNER when the first attempt is
- * denied); only a label that fails after the heal is a failure. The entry
- * count derives from the buffer, so a grant can carry its capability ACE and
- * its ambient-delete deny in one merge.
+ * what the label write needs, losing even the DACL grant. With the privilege
+ * held the label goes out directly; without it {@link healLabelAccess} is the
+ * path (momentary inheritable WRITE_OWNER, label write, verbatim DACL
+ * restore), because a plain write there can skip the children and still
+ * report success; only a label that fails through the assist is a failure.
+ * The entry count derives from the buffer, so a grant can carry its capability
+ * ACE and its ambient-delete deny in one merge.
  * @param api - the binding table.
  * @param path - the directory the DACL and label edits apply to.
  * @param entries - packed EXPLICIT_ACCESS_W records to merge (grant, deny, or revoke).
@@ -310,36 +325,38 @@ function mergeAndApply(
     return
   }
 
-  // Step B: enable the SeRelabelPrivilege the SACL write can use. The LABEL
-  // goes out EITHER WAY: the kernel accepts the label write when the caller
-  // holds the privilege OR the WRITE_OWNER right on the directory (the owner
-  // holds WRITE_OWNER implicitly, and an inherited Full/Modify ACE carries
-  // it), so an unprivileged caller frequently labels the root cleanly on the
-  // first attempt. When that attempt is denied anyway, Step C' self-heals.
+  // Step B: enable the SeRelabelPrivilege the SACL write can use, and pick
+  // the path the LABEL goes out by. The kernel accepts the label write on the
+  // strength of the privilege OR the WRITE_OWNER right — and the eager
+  // inheritance walk needs it on EACH CHILD, not just on the directory the
+  // call names. Ownership implies WRITE_DAC but NOT WRITE_OWNER, so on a host
+  // without the privilege a plain label write stamps the root, silently skips
+  // every child the caller cannot relabel, and STILL returns ERROR_SUCCESS:
+  // success there proves nothing about the tree, which rules out plain-
+  // attempt-first as the gate. Without the privilege the assist IS the path:
+  // {@link healLabelAccess} grants a momentary (OI|CI)-inheritable
+  // WRITE_OWNER, writes the label — one kernel walk labels the whole tree,
+  // pre-existing files included — and restores the DACL verbatim.
   const privilege = ensureRelabelPrivilege(api, `${label}(${path}) label step`)
+  const labelSacl = labelEdit.kind === 'apply' ? labelEdit.acl : null
 
   // Step C: the LABEL edit goes out ALONE — `apply` sets the Low no-write-up
   // ACE, `clear` replaces the SACL with a NULL pointer (removes every label
   // ACE). The label is not optional: a DACL-only grant would leave the child
   // able to write UP into Medium-IL targets outside the roots, so a label
-  // that cannot be written (even after the heal) throws fail-closed — the
+  // that cannot be written (even through the assist) throws fail-closed — the
   // caller's init() must not report a workspace the confined child cannot
   // safely use.
-  const labelSacl = labelEdit.kind === 'apply' ? labelEdit.acl : null
-  let labelResult = api.setNamedSecurityInfoW(
-    path, abi.SE_FILE_OBJECT, abi.LABEL_SECURITY_INFORMATION, null, null, null, labelSacl,
-  )
-  if (labelResult !== abi.ERROR_SUCCESS) {
-    // One self-heal pass on an access denial: grant the caller's own
-    // WRITE_OWNER on the directory (the owner-implicit WRITE_DAC authorizes
-    // the DACL edit), retry the label once, then restore the pre-heal DACL
-    // from the snapshot taken before the merge.
-    // Never skip the label because the privilege is absent — the privilege
-    // was never the only gate, and a skipped label silently disables the
-    // integrity confinement while reporting success.
-    if (!privilege.enabled && labelResult === abi.ERROR_ACCESS_DENIED) {
-      labelResult = healLabelAccess(api, path, labelSacl, labelResult)
-    }
+  let labelResult = privilege.enabled
+    ? api.setNamedSecurityInfoW(
+      path, abi.SE_FILE_OBJECT, abi.LABEL_SECURITY_INFORMATION, null, null, null, labelSacl,
+    )
+    : healLabelAccess(api, path, labelSacl, abi.ERROR_ACCESS_DENIED)
+  if (privilege.enabled && labelResult === abi.ERROR_ACCESS_DENIED) {
+    // Defensive: the privilege is held yet the plain write was denied — an
+    // object the privilege cannot relabel. The assist covers the anomalous
+    // case exactly as it covers the ordinary unprivileged one.
+    labelResult = healLabelAccess(api, path, labelSacl, labelResult)
   }
   freeLabelIfOwned(api, labelEdit, `${label}(${path})`)
   if (labelResult !== abi.ERROR_SUCCESS) {
@@ -539,14 +556,28 @@ function readCallerUserSid(api: Win32Bindings): NativePtr {
 }
 
 /**
- * Grant the caller a temporary {@link abi.WRITE_OWNER} right on `path`, retry
- * the LABEL write once, then restore the directory's DACL to EXACTLY the
- * snapshot taken before the grant. This is the self-heal that makes
- * `Workspace Write` work non-elevated on a directory whose DACL grants the
- * caller Modify (not Full) and that carries no SeRelabelPrivilege: the kernel
- * accepts EITHER the privilege OR object WRITE_OWNER for a SACL write, and
- * the caller's owner-implicit WRITE_DAC authorizes the DACL edit that adds
- * the right.
+ * Write the LABEL from a host WITHOUT SeRelabelPrivilege: grant the caller a
+ * momentary {@link abi.WRITE_OWNER} right on `path` INHERITED BY EVERY CHILD
+ * ({@link abi.SUB_CONTAINERS_AND_OBJECTS_INHERIT}), write the label, then
+ * restore the directory's DACL to EXACTLY the snapshot taken before the grant.
+ * This is the label path on any host where {@link ensureRelabelPrivilege}
+ * fails — not the retry after a denial, because the plain write it replaces
+ * cannot be trusted as a gate: it returns ERROR_SUCCESS while the inheritance
+ * walk silently skips every child the caller cannot relabel, leaving the root
+ * labelled and the children (`.git` first among them) confined-write-denied.
+ * The right the kernel needs on each child is exactly what the inheritable WO
+ * grant supplies, so the ONE label write carries the whole tree — files
+ * included (a file cannot carry the label on its own; the (OI) inheritance is
+ * what puts it there, so there is no separate file pass to make).
+ *
+ * The caller's owner-implicit WRITE_DAC authorizes the DACL edit that adds and
+ * later removes the right. Three eager inheritance walks is the accepted price
+ * (measured ~120 microseconds per object: seconds on a large tree); the
+ * alternative is elevation or a hand-run icacls for every workspace, which
+ * this module exists to avoid. This code runs inside the sandbox runner, whose
+ * stdout IS the control protocol and whose stderr is checked clean, so it
+ * stays SILENT here — the pacing warning lives in the diagnosis repair that a
+ * human runs (see the diagnose-windows-sandbox-acl skill).
  *
  * Restore-by-snapshot (not grant-then-REVOKE): a {@link abi.REVOKE_ACCESS}
  * merge on the same trustee the grant consolidated onto has
@@ -560,12 +591,13 @@ function readCallerUserSid(api: Win32Bindings): NativePtr {
  * NOT a security concession: the caller's own user SID (not the agent's
  * capability SID) is named; {@link abi.WRITE_OWNER} never enters
  * {@link abi.GRANT_MASK}; and the right exists only between the grant and the
- * restore inside this one call.
+ * restore inside this one call. The walk touches labels only — no child DACL,
+ * owner, or attribute is rewritten.
  * @param api - the binding table.
  * @param path - the directory the label write targets.
  * @param labelSacl - the SACL pointer the label write carries (null = clear).
- * @param firstResult - the original label failure code, returned on any heal-step failure.
- * @returns the retry's SetNamedSecurityInfoW code (or `firstResult`).
+ * @param firstResult - the label failure this call replaces, returned on any assist-step failure.
+ * @returns the label write's SetNamedSecurityInfoW code (or `firstResult`).
  */
 function healLabelAccess(
   api: Win32Bindings,
@@ -594,11 +626,13 @@ function healLabelAccess(
   let granted = false
   try {
     const aclSlot = allocPtrSlot()
-    // Inheritance 0: the label write targets the root object itself, so the
-    // temporary right never touches the child tree (no inheritable ACE means
-    // no propagation walk on either the grant or the restore write).
+    // Inheritance OI|CI: the temporary right must reach EVERY CHILD, because
+    // the label write's eager inheritance walk asks for WRITE_OWNER on each
+    // object it descends into. A root-only grant (inheritance 0) lets the
+    // write stamp the root and quietly skip the children while still
+    // returning ERROR_SUCCESS — the half-granted workspace this fix removes.
     const mergeResult = api.setEntriesInAclW(
-      1, buildExplicitAccess(selfSid, abi.GRANT_ACCESS, abi.WRITE_OWNER, 0), oldAcl, aclSlot,
+      1, buildExplicitAccess(selfSid, abi.GRANT_ACCESS, abi.WRITE_OWNER, abi.SUB_CONTAINERS_AND_OBJECTS_INHERIT), oldAcl, aclSlot,
     )
     const mergedAcl = mergeResult === abi.ERROR_SUCCESS ? decodePtr(aclSlot) : null
     if (mergedAcl === null) return firstResult // grant merge failed: nothing written
@@ -658,7 +692,7 @@ function reportLabelFailure(
   const detail = `${label}(${path}) LABEL step (DACL grant applied; integrity label NOT applied) — `
     + `privilege: ${privilege.enabled ? 'SeRelabelPrivilege enabled' : privilege.reason}; `
     + `Win32 ${win32Code}${message === '' ? '' : `: ${message}`} — `
-    + 'the SACL write needs the SeRelabelPrivilege privilege OR the WRITE_OWNER right on the directory; the WRITE_OWNER self-heal was attempted and failed. '
+    + 'the SACL write needs the SeRelabelPrivilege privilege OR the WRITE_OWNER right on the directory and its children; the momentary WRITE_OWNER assist was attempted and failed. '
     + `The current user cannot edit this directory's ACL: pick a directory you own, or grant WRITE_OWNER with icacls "${path}" /grant %USERNAME%:(OI)(CI)(WO), then retry.`
   throw new Win32Error('SetNamedSecurityInfoW', win32Code, detail)
 }
@@ -766,10 +800,12 @@ function hasForeignGrant(oldAcl: NativePtr, sidPtr: NativePtr): boolean {
  * large workspaces). Otherwise read-merge-write, so pre-existing explicit ACEs
  * survive (same shape as {@link revokeWrite}). Runs under the per-path lock.
  * The directory must be owned by the caller (owner-implicit WRITE_DAC covers
- * the DACL step). The LABEL step needs SeRelabelPrivilege OR WRITE_OWNER on
- * the directory: when the first label write is denied and the privilege is
- * absent, the grant self-heals once ({@link healLabelAccess}) by temporarily
- * granting the caller's own WRITE_OWNER; a label that still cannot be
+ * the DACL step). The LABEL step propagates to the whole tree: with
+ * SeRelabelPrivilege the direct write reaches every child, and without it the
+ * {@link healLabelAccess} assist grants the caller a momentary
+ * (OI|CI)-inheritable WRITE_OWNER so the one label write covers pre-existing
+ * children too, then restores the DACL verbatim — a few inheritance walks, so
+ * adding a large workspace takes a moment. A label that still cannot be
  * written throws, so init() never reports a workspace whose integrity
  * protection is missing.
  * @param api - the binding table.
