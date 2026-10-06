@@ -879,41 +879,61 @@ describe('the decoupled DACL / LABEL apply', () => {
     expect(labelCall[6]).toBe(11n) // the label ACL built by buildLowLabelAcl
   })
 
-  it('attempts the LABEL even when the privilege cannot be enabled (it may pass on WRITE_OWNER)', () => {
+  it('writes the LABEL through the WRITE_OWNER assist when the privilege cannot be enabled', () => {
     const sid = craftSid(1, 0)
     const lowSid = craftLowLabelSid()
     const world = craftWorldSid()
+    const selfUser = craftSid(1, 1, [0, 0, 0, 0, 0, 5])
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => 0)
     const localFree = vi.fn(() => 0n as NativePtr)
     const api = aclApi({
       setNamedSecurityInfoW,
-      adjustTokenPrivileges: vi.fn(() => 0), // the enable fails
+      adjustTokenPrivileges: vi.fn(() => 0), // the enable fails: the assist is the label path
       getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
+      // A real (non-null) DACL for the assist to merge the temporary WRITE_OWNER into.
+      getNamedSecurityInfoW: readStub(craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true), null, 6n),
+      getTokenInformation: vi.fn((_token: unknown, cls: number, info: Buffer | null, _length: number, needed: NativePtr) => {
+        if (info === null) {
+          koffi.encode(needed, 'uint32', 8)
+          return 0
+        }
+        if (cls === abi.TokenUser) {
+          koffi.encode(info, 0, PVOID, ptrAddress(selfUser)) // TOKEN_USER.Sid
+          return 1
+        }
+        info.writeUInt32LE(1, 0)
+        return 1
+      }),
+      copySid: vi.fn(() => 1),
       localFree,
     })
     expect(() => {
       grantWrite(api, 'C:\\granted', sid, lowSid, world)
     }).not.toThrow()
-    // Both steps went out: the privilege was never the only gate — an owner
-    // (or inherited Full/Modify) passes the LABEL write without it.
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
+    // Without the privilege the label goes out through the assist: the DACL step,
+    // the inherited WRITE_OWNER grant, the LABEL write, then the verbatim restore.
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(4)
     const daclCall = requireApplyCall(setNamedSecurityInfoW, 0)
     expect(daclCall[2] & abi.DACL_SECURITY_INFORMATION).toBe(abi.DACL_SECURITY_INFORMATION)
     expect(daclCall[2] & abi.LABEL_SECURITY_INFORMATION).toBe(0)
-    const labelCall = requireApplyCall(setNamedSecurityInfoW, 1)
+    expect(requireApplyCall(setNamedSecurityInfoW, 1)[2]).toBe(abi.DACL_SECURITY_INFORMATION) // the WO grant pass
+    const labelCall = requireApplyCall(setNamedSecurityInfoW, 2)
     expect(labelCall[2]).toBe(abi.LABEL_SECURITY_INFORMATION)
+    expect(labelCall[6]).toBe(11n) // the label ACL built by buildLowLabelAcl
+    expect(requireApplyCall(setNamedSecurityInfoW, 3)[2]).toBe(abi.DACL_SECURITY_INFORMATION) // the restore pass
     // The label ACL is released; no degrade warning — the label was applied.
     expect(localFree).toHaveBeenCalledWith(11n)
     expect(warn).not.toHaveBeenCalled()
     warn.mockRestore()
   })
 
-  it('survives a stub without the privilege bindings (LABEL still attempted, succeeds)', () => {
+  it('fails closed when the privilege bindings are missing (the assist cannot read the caller identity)', () => {
     // A partial stub without openProcess/openProcessToken/getTokenInformation/
     // lookupPrivilegeValueW/adjustTokenPrivileges: the privilege helper reports
-    // it unavailable, the LABEL still goes out, and a success keeps the grant
-    // whole — the label is never skipped because the privilege step broke.
+    // it unavailable AND the WRITE_OWNER assist cannot read the caller's SID,
+    // so the label never goes out. The grant fails closed — the applied DACL
+    // half is never reported as a usable workspace.
     const { api, setNamedSecurityInfoW } = (() => {
       const base = aclApi({})
       const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => 0)
@@ -927,17 +947,15 @@ describe('the decoupled DACL / LABEL apply', () => {
     })()
     expect(() => {
       grantWrite(api, 'C:\\granted', craftSid(1, 0), craftLowLabelSid(), craftWorldSid())
-    }).not.toThrow()
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
+    }).toThrow(/WRITE_OWNER assist was attempted and failed/)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1) // the DACL step only: no label write
     const daclCall = requireApplyCall(setNamedSecurityInfoW, 0)
     expect(daclCall[2] & abi.LABEL_SECURITY_INFORMATION).toBe(0)
-    const labelCall = requireApplyCall(setNamedSecurityInfoW, 1)
-    expect(labelCall[2]).toBe(abi.LABEL_SECURITY_INFORMATION)
   })
 
-  it('throws fail-closed when the LABEL is denied and no self-heal applies (privilege enabled)', () => {
-    // Privilege enabled but the write denied: the heal is for the no-privilege
-    // case only (an enabled privilege outranks object rights), so this fails
+  it('throws fail-closed when the LABEL is denied with the privilege enabled and the assist cannot run', () => {
+    // Privilege enabled but the write denied: the defensive assist still runs,
+    // aborts here because this stub has no CopySid binding, and the grant fails
     // closed naming the true gate instead of reporting success.
     const sid = craftSid(1, 0)
     const lowSid = craftLowLabelSid()
@@ -948,33 +966,39 @@ describe('the decoupled DACL / LABEL apply', () => {
     expect(() => {
       grantWrite(api, 'C:\\granted', sid, lowSid, world)
     }).toThrow(/WRITE_OWNER/)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2) // DACL + one LABEL
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2) // DACL + one LABEL, no assist writes
     const labelCall = requireApplyCall(setNamedSecurityInfoW, 1)
     expect(labelCall[2]).toBe(abi.LABEL_SECURITY_INFORMATION)
   })
 
-  it('self-heals a denied LABEL with a temporary caller WRITE_OWNER and revokes it', () => {
+  it('writes the LABEL through a temporary inherited caller WRITE_OWNER and restores the DACL', () => {
     const sid = craftSid(1, 0)
     const lowSid = craftLowLabelSid()
     const world = craftWorldSid()
     const selfUser = craftSid(1, 1, [0, 0, 0, 0, 0, 5])
-    // Call sequence: DACL grant OK, LABEL denied, heal WO-grant DACL OK,
-    // LABEL retry OK, restore pre-heal DACL OK.
-    const results = [0, abi.ERROR_ACCESS_DENIED, 0, 0, 0]
+    // Call sequence: DACL grant OK, assist WO-grant DACL OK, LABEL OK, restore
+    // pre-heal DACL OK. There is no plain LABEL attempt: without the privilege
+    // the assist IS the label path.
+    const results = [0, 0, 0, 0]
     const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => results.shift() ?? 0)
+    const healModes: number[] = []
+    const healMasks: number[] = []
+    const healInheritance: number[] = []
     const setEntriesInAclW = vi.fn<Win32Bindings['setEntriesInAclW']>((_count: unknown, entries: Buffer, _old: unknown, newAcl: NativePtr) => {
       koffi.encode(newAcl, PVOID, 9n)
-      // Remember the EXPLICIT_ACCESS_W.grfAccessMode of every merge.
+      // Remember the EXPLICIT_ACCESS_W fields of every merge: perms@0, mode@4,
+      // grfInheritance@8.
+      healMasks.push(koffi.decode(entries, 0, 'uint32') as number)
       healModes.push(koffi.decode(entries, 4, 'int32') as number)
+      healInheritance.push(koffi.decode(entries, 8, 'uint32') as number)
       return 0
     })
-    const healModes: number[] = []
     const api = aclApi({
       setNamedSecurityInfoW,
       setEntriesInAclW,
       // A real (non-null) DACL to merge the temporary WRITE_OWNER into.
       getNamedSecurityInfoW: readStub(craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true), null, 6n),
-      adjustTokenPrivileges: vi.fn(() => 0), // no privilege: the heal branch
+      adjustTokenPrivileges: vi.fn(() => 0), // no privilege: the assist path
       getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
       getTokenInformation: vi.fn((_token: unknown, cls: number, info: Buffer | null, _length: number, needed: NativePtr) => {
         if (info === null) {
@@ -993,29 +1017,37 @@ describe('the decoupled DACL / LABEL apply', () => {
     expect(() => {
       grantWrite(api, 'C:\\granted', sid, lowSid, world)
     }).not.toThrow()
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(5)
-    expect(requireApplyCall(setNamedSecurityInfoW, 2)[2]).toBe(abi.DACL_SECURITY_INFORMATION) // WO grant pass
-    const retry = requireApplyCall(setNamedSecurityInfoW, 3)
-    expect(retry[2]).toBe(abi.LABEL_SECURITY_INFORMATION) // the label persisted on retry
-    expect(requireApplyCall(setNamedSecurityInfoW, 4)[2]).toBe(abi.DACL_SECURITY_INFORMATION) // restore pass
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(4)
+    expect(requireApplyCall(setNamedSecurityInfoW, 1)[2]).toBe(abi.DACL_SECURITY_INFORMATION) // WO grant pass
+    const labelCall = requireApplyCall(setNamedSecurityInfoW, 2)
+    expect(labelCall[2]).toBe(abi.LABEL_SECURITY_INFORMATION) // the label went out on the assist
+    expect(requireApplyCall(setNamedSecurityInfoW, 3)[2]).toBe(abi.DACL_SECURITY_INFORMATION) // restore pass
     // The restore pass rewrites the pre-heal ACL directly (no merge), so only
-    // two merges ran: the grant's own (deny entry packed first) and the heal's
+    // two merges ran: the grant's own (deny entry packed first) and the assist's
     // WRITE_OWNER grant.
     expect(healModes).toEqual([abi.DENY_ACCESS, abi.GRANT_ACCESS])
+    // The regression this fix exists for: the temporary WRITE_OWNER must be
+    // inherited (OI)(CI). The label write's eager inheritance walk asks for
+    // WRITE_OWNER on EVERY child it descends into, so a root-only grant stamps
+    // the root, silently skips the whole tree, and still reports ERROR_SUCCESS.
+    expect(healMasks[1]).toBe(abi.WRITE_OWNER)
+    expect(healInheritance[1]).toBe(abi.SUB_CONTAINERS_AND_OBJECTS_INHERIT)
+    // The standing grant mask never carries WRITE_OWNER: the assist is transient.
+    expect(healMasks[0]! & abi.WRITE_OWNER).toBe(0)
   })
 
-  it('fails closed when the LABEL stays denied even after the WRITE_OWNER heal', () => {
+  it('fails closed when the LABEL stays denied even after the WRITE_OWNER assist', () => {
     const sid = craftSid(1, 0)
     const lowSid = craftLowLabelSid()
     const world = craftWorldSid()
     const selfUser = craftSid(1, 1, [0, 0, 0, 0, 0, 5])
-    // The LABEL denies on BOTH attempts: DACL grant OK, LABEL 5, heal grant OK,
-    // retry 5, revoke OK.
-    const results = [0, abi.ERROR_ACCESS_DENIED, 0, abi.ERROR_ACCESS_DENIED, 0]
+    // The LABEL denies even with the temporary WRITE_OWNER held: DACL grant OK,
+    // assist grant OK, LABEL 5, restore OK.
+    const results = [0, 0, abi.ERROR_ACCESS_DENIED, 0]
     const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => results.shift() ?? 0)
     const api = aclApi({
       setNamedSecurityInfoW,
-      // A real (non-null) DACL so the heal's WRITE_OWNER merge can proceed.
+      // A real (non-null) DACL so the assist's WRITE_OWNER merge can proceed.
       getNamedSecurityInfoW: readStub(craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true), null, 6n),
       adjustTokenPrivileges: vi.fn(() => 0), // no privilege
       getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
@@ -1042,16 +1074,16 @@ describe('the decoupled DACL / LABEL apply', () => {
     expect(caught).toBeInstanceOf(Win32Error)
     expect((caught as Win32Error).win32Code).toBe(abi.ERROR_ACCESS_DENIED)
     expect((caught as Error).message).toContain('WRITE_OWNER')
-    expect((caught as Error).message).toContain('self-heal was attempted and failed')
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(5)
+    expect((caught as Error).message).toContain('WRITE_OWNER assist was attempted and failed')
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(4) // DACL, assist grant, LABEL, restore
   })
 
-  it('reports the original denial when the heal cannot read the caller identity', () => {
+  it('reports the original denial when the assist cannot read the caller identity', () => {
     const sid = craftSid(1, 0)
     const lowSid = craftLowLabelSid()
     const world = craftWorldSid()
-    // LABEL denied; the identity read fails (no copySid binding) so the heal
-    // aborts without touching the DACL and the original error surfaces.
+    // The identity read fails (no copySid binding) so the assist aborts before
+    // its first write and the original denial surfaces unchanged.
     const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>((_p: unknown, _t: unknown, info: number) =>
       (info & abi.LABEL_SECURITY_INFORMATION) !== 0 ? abi.ERROR_ACCESS_DENIED : 0)
     const api = aclApi({
@@ -1061,8 +1093,8 @@ describe('the decoupled DACL / LABEL apply', () => {
     })
     expect(() => {
       grantWrite(api, 'C:\\granted', sid, lowSid, world)
-    }).toThrow(/self-heal was attempted and failed/)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2) // DACL + LABEL only
+    }).toThrow(/WRITE_OWNER assist was attempted and failed/)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1) // the DACL step only: the assist wrote nothing
   })
 })
 
@@ -1269,10 +1301,10 @@ describe('ensureRelabelPrivilege remaining failure paths', () => {
   })
 })
 
-describe('readCallerUserSid sub-failures (driven through the grant self-heal)', () => {
+describe('readCallerUserSid sub-failures (driven through the WRITE_OWNER assist)', () => {
   // Shared scaffolding: a real (non-exact) DACL, the LABEL denied, and the
-  // privilege disabled, so every grantWrite reaches healLabelAccess and the
-  // injected failure lands in the heal's identity read.
+  // privilege disabled, so every grantWrite goes straight to healLabelAccess and
+  // the injected failure lands in the assist's identity read.
   function deniedLabelApi(overrides: Partial<Win32Bindings> = {}) {
     const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>((_p: unknown, _t: unknown, info: number) =>
       (info & abi.LABEL_SECURITY_INFORMATION) !== 0 ? abi.ERROR_ACCESS_DENIED : 0)
@@ -1280,18 +1312,18 @@ describe('readCallerUserSid sub-failures (driven through the grant self-heal)', 
     const api = aclApi({
       setNamedSecurityInfoW,
       getNamedSecurityInfoW: readStub(craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true), null, 6n),
-      adjustTokenPrivileges: vi.fn(() => 0), // no privilege: the heal branch
+      adjustTokenPrivileges: vi.fn(() => 0), // no privilege: the assist is the label path
       getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
       ...overrides,
     })
     return { api, setNamedSecurityInfoW }
   }
 
-  function assertSelfHealAborted(caught: unknown, setNamedSecurityInfoW: Mock<Win32Bindings['setNamedSecurityInfoW']>): void {
+  function assertAssistAborted(caught: unknown, setNamedSecurityInfoW: Mock<Win32Bindings['setNamedSecurityInfoW']>): void {
     expect(caught).toBeInstanceOf(Win32Error)
     expect((caught as Win32Error).win32Code).toBe(abi.ERROR_ACCESS_DENIED)
-    expect((caught as Error).message).toContain('self-heal was attempted and failed')
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2) // DACL + LABEL, no heal writes
+    expect((caught as Error).message).toContain('WRITE_OWNER assist was attempted and failed')
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1) // the DACL step only: the assist wrote nothing
   }
 
   it('reports the denial when the identity OpenProcess fails', () => {
@@ -1299,7 +1331,7 @@ describe('readCallerUserSid sub-failures (driven through the grant self-heal)', 
     const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
     let caught: unknown
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
-    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+    assertAssistAborted(caught, setNamedSecurityInfoW)
   })
 
   it('reports the denial when the identity OpenProcessToken fails', () => {
@@ -1307,7 +1339,7 @@ describe('readCallerUserSid sub-failures (driven through the grant self-heal)', 
     const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
     let caught: unknown
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
-    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+    assertAssistAborted(caught, setNamedSecurityInfoW)
   })
 
   it('reports the denial when the identity token handle is null', () => {
@@ -1320,7 +1352,7 @@ describe('readCallerUserSid sub-failures (driven through the grant self-heal)', 
     const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
     let caught: unknown
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
-    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+    assertAssistAborted(caught, setNamedSecurityInfoW)
   })
 
   it('reports the denial when the TokenUser size query is implausible', () => {
@@ -1341,7 +1373,7 @@ describe('readCallerUserSid sub-failures (driven through the grant self-heal)', 
     const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
     let caught: unknown
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
-    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+    assertAssistAborted(caught, setNamedSecurityInfoW)
   })
 
   it('reports the denial when the TokenUser read fails', () => {
@@ -1359,7 +1391,7 @@ describe('readCallerUserSid sub-failures (driven through the grant self-heal)', 
     const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
     let caught: unknown
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
-    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+    assertAssistAborted(caught, setNamedSecurityInfoW)
   })
 
   it('reports the denial when the TokenUser read yields a null SID', () => {
@@ -1380,7 +1412,7 @@ describe('readCallerUserSid sub-failures (driven through the grant self-heal)', 
     const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
     let caught: unknown
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
-    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+    assertAssistAborted(caught, setNamedSecurityInfoW)
   })
 
   it('reports the denial when GetLengthSid rejects the identity SID', () => {
@@ -1403,7 +1435,7 @@ describe('readCallerUserSid sub-failures (driven through the grant self-heal)', 
     const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
     let caught: unknown
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
-    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+    assertAssistAborted(caught, setNamedSecurityInfoW)
   })
 
   it('reports the denial when the identity SID copy allocation fails', () => {
@@ -1414,7 +1446,7 @@ describe('readCallerUserSid sub-failures (driven through the grant self-heal)', 
     const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
     let caught: unknown
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
-    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+    assertAssistAborted(caught, setNamedSecurityInfoW)
   })
 
   it('reports the denial when CopySid fails', () => {
@@ -1422,7 +1454,7 @@ describe('readCallerUserSid sub-failures (driven through the grant self-heal)', 
     const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
     let caught: unknown
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
-    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+    assertAssistAborted(caught, setNamedSecurityInfoW)
   })
 
   it('reports the denial when the identity token handle cannot be closed', () => {
@@ -1435,7 +1467,7 @@ describe('readCallerUserSid sub-failures (driven through the grant self-heal)', 
     const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
     let caught: unknown
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
-    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+    assertAssistAborted(caught, setNamedSecurityInfoW)
   })
 
   it('reports the denial when the identity process handle cannot be closed', () => {
@@ -1448,12 +1480,12 @@ describe('readCallerUserSid sub-failures (driven through the grant self-heal)', 
     const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
     let caught: unknown
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
-    assertSelfHealAborted(caught, setNamedSecurityInfoW)
+    assertAssistAborted(caught, setNamedSecurityInfoW)
   })
 })
 
 describe('healLabelAccess body failures', () => {
-  it('aborts the heal and fails closed when the re-read yields no DACL', () => {
+  it('aborts the assist and fails closed when the re-read yields no DACL', () => {
     const world = craftWorldSid()
     const realDacl = craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true)
     let readCalls = 0
@@ -1483,13 +1515,13 @@ describe('healLabelAccess body failures', () => {
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
     expect(caught).toBeInstanceOf(Win32Error)
     expect((caught as Win32Error).win32Code).toBe(abi.ERROR_ACCESS_DENIED)
-    expect((caught as Error).message).toContain('self-heal was attempted and failed')
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
-    expect(localFree).toHaveBeenCalledWith(6n) // the descriptor freed on the no-DACL heal path
+    expect((caught as Error).message).toContain('WRITE_OWNER assist was attempted and failed')
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1) // the DACL step only: the assist wrote nothing
+    expect(localFree).toHaveBeenCalledWith(6n) // the descriptor freed on the no-DACL assist path
     expect(readCalls).toBe(2)
   })
 
-  it('aborts the heal when the WRITE_OWNER merge fails', () => {
+  it('aborts the assist when the WRITE_OWNER merge fails', () => {
     const world = craftWorldSid()
     let mergeCalls = 0
     const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>((_p: unknown, _t: unknown, info: number) =>
@@ -1502,9 +1534,9 @@ describe('healLabelAccess body failures', () => {
           koffi.encode(newAcl, PVOID, 9n)
           return 0
         }
-        return 1 // the heal's WRITE_OWNER merge fails
+        return 1 // the assist's WRITE_OWNER merge fails
       }),
-      // A null descriptor on the re-read: the heal's finally skips its descriptor free.
+      // A null descriptor on the re-read: the assist's finally skips its descriptor free.
       getNamedSecurityInfoW: readStub(craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true), null, null),
       adjustTokenPrivileges: vi.fn(() => 0),
       getLastError: vi.fn(() => abi.ERROR_NO_SUCH_PRIVILEGE),
@@ -1515,14 +1547,14 @@ describe('healLabelAccess body failures', () => {
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
     expect(caught).toBeInstanceOf(Win32Error)
     expect((caught as Win32Error).win32Code).toBe(abi.ERROR_ACCESS_DENIED)
-    expect((caught as Error).message).toContain('self-heal was attempted and failed')
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
+    expect((caught as Error).message).toContain('WRITE_OWNER assist was attempted and failed')
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1) // the DACL step only: the merge failed first
     expect(mergeCalls).toBe(2)
   })
 
-  it('aborts the heal when the temporary WRITE_OWNER grant cannot be written', () => {
+  it('aborts the assist when the temporary WRITE_OWNER grant cannot be written', () => {
     const world = craftWorldSid()
-    const results = [0, abi.ERROR_ACCESS_DENIED, abi.ERROR_ACCESS_DENIED]
+    const results = [0, abi.ERROR_ACCESS_DENIED]
     const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => results.shift() ?? 0)
     const api = aclApi({
       setNamedSecurityInfoW,
@@ -1536,13 +1568,13 @@ describe('healLabelAccess body failures', () => {
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
     expect(caught).toBeInstanceOf(Win32Error)
     expect((caught as Win32Error).win32Code).toBe(abi.ERROR_ACCESS_DENIED)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(3) // DACL, LABEL, failed WO grant (no retry, no restore)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2) // DACL, failed WO grant (no label write, no restore)
   })
 
-  it('warns (label applied) when the restore write fails but the retry succeeded', () => {
+  it('warns (label applied) when the restore write fails but the assist succeeded', () => {
     const world = craftWorldSid()
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const results = [0, abi.ERROR_ACCESS_DENIED, 0, 0, abi.ERROR_ACCESS_DENIED]
+    const results = [0, 0, 0, abi.ERROR_ACCESS_DENIED]
     const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => results.shift() ?? 0)
     const api = aclApi({
       setNamedSecurityInfoW,
@@ -1553,16 +1585,16 @@ describe('healLabelAccess body failures', () => {
     })
     const sid = craftSid(1, 0); const lowSid = craftLowLabelSid()
     expect(() => { grantWrite(api, 'C:\\granted', sid, lowSid, world) }).not.toThrow()
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(5)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(4)
     expect(warn).toHaveBeenCalledTimes(1)
     expect(warn.mock.calls.at(0)?.[0]).toContain('integrity label applied')
     warn.mockRestore()
   })
 
-  it('warns (label not applied) and fails closed when the retry and the restore both fail', () => {
+  it('warns (label not applied) and fails closed when the label write and the restore both fail', () => {
     const world = craftWorldSid()
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const results = [0, abi.ERROR_ACCESS_DENIED, 0, abi.ERROR_ACCESS_DENIED, abi.ERROR_ACCESS_DENIED]
+    const results = [0, 0, abi.ERROR_ACCESS_DENIED, abi.ERROR_ACCESS_DENIED]
     const setNamedSecurityInfoW = vi.fn<Win32Bindings['setNamedSecurityInfoW']>(() => results.shift() ?? 0)
     const api = aclApi({
       setNamedSecurityInfoW,
@@ -1577,7 +1609,7 @@ describe('healLabelAccess body failures', () => {
     expect(caught).toBeInstanceOf(Win32Error)
     expect(warn).toHaveBeenCalledTimes(1)
     expect(warn.mock.calls.at(0)?.[0]).toContain('integrity label not applied')
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(5)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(4)
     warn.mockRestore()
   })
 })
@@ -1617,12 +1649,26 @@ describe('mergeAndApply LocalFree-result checks', () => {
 
   it('throws from the checked descriptor LocalFree after a fully successful grant', () => {
     const sid = craftSid(1, 0); const lowSid = craftLowLabelSid(); const world = craftWorldSid()
+    const selfUser = craftSid(1, 1, [0, 0, 0, 0, 0, 5])
     const localFree = vi.fn((p: NativePtr) => (ptrAddress(p) === 6n ? (1n as NativePtr) : (0n as NativePtr)))
     const api = aclApi({
       getNamedSecurityInfoW: readStub(craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true), null, 6n),
       localFree,
-      setNamedSecurityInfoW: vi.fn(() => 0), // DACL and LABEL both succeed
-      adjustTokenPrivileges: vi.fn(() => 0), // privilege disabled, but the LABEL still passes
+      setNamedSecurityInfoW: vi.fn(() => 0), // DACL, assist grant, LABEL, restore all succeed
+      adjustTokenPrivileges: vi.fn(() => 0), // privilege disabled: the assist carries the label out
+      getTokenInformation: vi.fn((_token: unknown, cls: number, info: Buffer | null, _length: number, needed: NativePtr) => {
+        if (info === null) {
+          koffi.encode(needed, 'uint32', 8)
+          return 0
+        }
+        if (cls === abi.TokenUser) {
+          koffi.encode(info, 0, PVOID, ptrAddress(selfUser)) // TOKEN_USER.Sid
+          return 1
+        }
+        info.writeUInt32LE(1, 0)
+        return 1
+      }),
+      copySid: vi.fn(() => 1),
     })
     let caught: unknown
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
@@ -1658,7 +1704,7 @@ describe('reportLabelFailure system-text detail', () => {
   })
 })
 
-describe('mergeAndApply and heal remaining branch edges', () => {
+describe('mergeAndApply and healLabelAccess remaining branch edges', () => {
   it('skips the label-ACL free when the DACL step fails on a revoke (no label to own)', () => {
     // A grant for the SAME sid being revoked is not a foreign grant, so the
     // label edit is `clear` — there is no label ACL owned when the DACL step
@@ -1676,7 +1722,7 @@ describe('mergeAndApply and heal remaining branch edges', () => {
     expect((caught as Win32Error).api).toBe('SetNamedSecurityInfoW')
   })
 
-  it('aborts the heal without a descriptor free when the re-read yields no DACL or descriptor', () => {
+  it('aborts the assist without a descriptor free when the re-read yields no DACL or descriptor', () => {
     const world = craftWorldSid()
     const realDacl = craftAcl(abi.ACCESS_ALLOWED_ACE_TYPE, 0x100000, world, true)
     let readCalls = 0
@@ -1704,7 +1750,7 @@ describe('mergeAndApply and heal remaining branch edges', () => {
     try { grantWrite(api, 'C:\\granted', sid, lowSid, world) } catch (error) { caught = error }
     expect(caught).toBeInstanceOf(Win32Error)
     expect((caught as Win32Error).win32Code).toBe(abi.ERROR_ACCESS_DENIED)
-    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(2)
+    expect(setNamedSecurityInfoW).toHaveBeenCalledTimes(1) // the DACL step only: the assist wrote nothing
     expect(readCalls).toBe(2)
   })
 })

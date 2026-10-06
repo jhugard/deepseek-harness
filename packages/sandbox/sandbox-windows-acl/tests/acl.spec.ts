@@ -345,11 +345,16 @@ describe.skipIf(!isWin32)('ACL editing', () => {
     const apply = vi.spyOn(api, 'setNamedSecurityInfoW')
     try {
       grantWrite(api, dir, capabilitySid, lowSid, world)
-      expect(apply).toHaveBeenCalledTimes(2) // DACL step + LABEL step
+      // The DACL step and the LABEL step always go out. On a host without
+      // SeRelabelPrivilege the label goes out through the WRITE_OWNER assist,
+      // which wraps it in an inherited temporary grant and the verbatim restore.
+      const firstGrant = apply.mock.calls.map(call => call[2] as number)
+      expect(firstGrant.filter(info => info === abi.LABEL_SECURITY_INFORMATION)).toHaveLength(1)
+      expect(firstGrant.filter(info => (info & abi.DACL_SECURITY_INFORMATION) !== 0).length).toBeGreaterThanOrEqual(2)
       // The exact ACE, deny, and label now stand (the per-session grant
       // surviving from a previous server lifetime): the second grant is a read only.
       grantWrite(api, dir, capabilitySid, lowSid, world)
-      expect(apply).toHaveBeenCalledTimes(2) // the skip adds no apply
+      expect(apply).toHaveBeenCalledTimes(firstGrant.length) // the skip adds no apply
       const aces = readDirectAces(api, dir)
       expect(aces.filter(ace => ace.sid === 'S-1-4-4242-2')).toHaveLength(1)
       expect(aces.filter(ace => ace.sid === 'S-1-1-0')).toHaveLength(1)
