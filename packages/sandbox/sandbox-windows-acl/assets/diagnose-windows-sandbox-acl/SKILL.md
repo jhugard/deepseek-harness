@@ -30,6 +30,8 @@ Repeat the failing operation once confined. The script writes permissions, which
 
 Diagnose unexpected denials of workspace writes, listing, or plainly readable paths; explain expected ones instead: writes outside the workspace, any write in `read-only`, piped grandchild `spawn EPERM`, ConstrainedLanguage errors. If approval is refused or unavailable, report the path as undiagnosed and stop.
 
+**Warn the user before running it that this can take a few moments on a large project.** The repair walks the directory tree, and the first DSH provisioning of a repaired workspace re-labels every entry under it, so either pass costs seconds to tens of seconds on a big one. That wait is the walk, not a hang: say so, let it finish, and never re-run it because it is slow.
+
 ## Read the output
 
 Every record reaches stdout, the `acl-report-*.jsonl` file under `-Out`, and the final `RECAP` line, which carries the verdicts, changes, verifications, refusals and scans. Tool output keeps only its tail, so read the recap first, and read specific records from the report when it is not enough. Trust `verification` records, never `completed` actions. Decide from `details.nextAction`:
