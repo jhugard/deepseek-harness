@@ -2,7 +2,9 @@
 
 import { isDeepStrictEqual } from 'node:util'
 import { SessionFormatError, isSessionFormatJsonObject, sessionFormatCount } from '@deepseek-ai/dsh-session-format'
-import type { SessionFormatArtifact, SessionFormatEvent, SessionFormatJsonObject, SessionFormatJsonValue } from '@deepseek-ai/dsh-session-format'
+import type {
+  SessionFormatArtifact, SessionFormatEvent, SessionFormatJsonObject, SessionFormatJsonValue, SessionFormatRecovery,
+} from '@deepseek-ai/dsh-session-format'
 
 const SURFACE_TYPES = new Set(['system/message', 'user/message', 'developer/message', 'assistant/message', 'tool/result'])
 const STEP_EVENT_TYPES = new Set(['system/message', 'developer/message', 'assistant/attempt'])
@@ -58,10 +60,11 @@ class Relationships {
   surface: number[] = []
   protectedHead: number | undefined
   compaction: Compaction | undefined
-  // Each advertised id maps to its occurrences. Local patch: local OpenAI-compatible servers
-  // re-emit one tool call under the same composed id within one step; each occurrence needs its
-  // own tool/call and tool/result, matched in stream order (first unstarted, then first
-  // started). See pi-ai openai-completions normalizeToolCallId for the id composition.
+  // Each advertised id maps to its occurrences in advertisement order. A repeated id is admitted
+  // only under `recoverable` recovery; `strict` recovery refuses it. Each admitted occurrence still
+  // requires its own `tool/call` and `tool/result`, matched in stream order: a `tool/call` takes
+  // the earliest unstarted occurrence, a result the earliest started one, or the earliest
+  // unstarted one when none started.
   readonly tools = new Map<string, ToolState[]>()
   readonly dispatches = new Map<string, { data: SessionFormatJsonObject; settled: boolean }>()
   readonly retries: SessionFormatJsonObject[] = []
@@ -69,7 +72,11 @@ class Relationships {
   readonly commands = new Set<string>()
   readonly orphanCompactions = new Set<number>()
 
-  constructor(readonly artifact: SessionFormatArtifact, readonly knownEventTypes: ReadonlySet<string>) {
+  constructor(
+    readonly artifact: SessionFormatArtifact,
+    readonly knownEventTypes: ReadonlySet<string>,
+    readonly recovery: SessionFormatRecovery,
+  ) {
     let start: number | undefined
     for (const event of artifact.events) {
       if (!knownEventTypes.has(event.type)) continue
@@ -164,7 +171,9 @@ class Relationships {
         const state: ToolState = { name: block['name'], arguments: block['arguments'], started: false }
         const existing = this.tools.get(id)
         if (existing === undefined) this.tools.set(id, [state])
-        else existing.push(state)
+        else if (this.recovery === 'strict') {
+          throw new SessionFormatError(`assistant/message repeats advertised tool call ${id}`)
+        } else existing.push(state)
       }
       return
     }
@@ -186,9 +195,8 @@ class Relationships {
       if (!pending.started && !notStartedRepair(event, data, message, id)) {
         throw new SessionFormatError(`tool/result ${id} is not the exact TOOL_NOT_STARTED repair`)
       }
-      const remaining = group.filter(candidate => candidate !== pending)
-      if (remaining.length === 0) this.tools.delete(id)
-      else this.tools.set(id, remaining)
+      group.splice(group.indexOf(pending), 1)
+      if (group.length === 0) this.tools.delete(id)
     }
   }
 
@@ -391,8 +399,14 @@ function titleSources(
  * Validate native V4 lifecycle and ownership facts without rewriting any event.
  * @param artifact - artifact whose V4 envelopes and messages have been admitted.
  * @param knownEventTypes - installed event types whose payloads this reader interprets.
+ * @param recovery - `strict` refuses an id advertised more than once in one step; `recoverable`
+ *   admits each occurrence and matches every `tool/call` and `tool/result` to one in stream order.
  */
-export function assertV4LifecycleRelationships(artifact: SessionFormatArtifact, knownEventTypes: ReadonlySet<string>): void {
-  const state = new Relationships(artifact, knownEventTypes)
+export function assertV4LifecycleRelationships(
+  artifact: SessionFormatArtifact,
+  knownEventTypes: ReadonlySet<string>,
+  recovery: SessionFormatRecovery,
+): void {
+  const state = new Relationships(artifact, knownEventTypes, recovery)
   for (const event of artifact.events) state.accept(event)
 }

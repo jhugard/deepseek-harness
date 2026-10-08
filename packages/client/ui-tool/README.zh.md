@@ -69,7 +69,7 @@ owner 载荷为 `ToolCallOwnerProps`：`callId`、`toolName`、`phase` 判别字
 
 ### 渲染约定
 
-`ToolCallTree` 接收一个 Tool 节点、会话 `cwd` 和导航回调。每个分支接收稳定的 block，并缓存显式阶段 props，因此一个子调用变化不会重渲染未变化的兄弟分支。它通过 `tool.call.toolview` 按工具名分发。已派发的根调用保留递归 `subCalls`，准备阶段没有子调用。每个根调用和子调用包装层都保留 `data-chat-anchor-key="call:<id>"` 与 `data-chat-call-id` DOM 约定，供分页和选择使用；一个 step 内被声明多次的 callId 会为每个 occurrence 各生成一个包装层，因此这些属性会重复出现，由 occurrence 区分它们。Inspect 在 callId 之外传入节点自身的 occurrence。Tool 节点在三个阶段保持同一个 callId。
+`ToolCallTree` 接收一个 Tool 节点、会话 `cwd` 和导航回调。每个分支接收稳定的 block，并缓存显式阶段 props，因此一个子调用变化不会重渲染未变化的兄弟分支。它通过 `tool.call.toolview` 按工具名分发。已派发的根调用保留递归 `subCalls`，准备阶段没有子调用。每个根调用和子调用包装层都保留 `data-chat-anchor-key="call:<id>"` 与 `data-chat-call-id` DOM 约定，供分页和选择使用。Tool 节点在三个阶段保持同一个 callId。
 
 Tool 所有者属性将 Chat 注入的稳定 `useDisclosure` 钩子传给根调用及嵌套调用。工具行在拥有展开正文的位置调用它，中间 renderer 不订阅。每次调用拥有独立展开状态，外层轮次收起时重置该状态，不替换 React 身份；展示模式切换保留该状态。
 

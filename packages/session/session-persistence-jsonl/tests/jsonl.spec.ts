@@ -2062,6 +2062,36 @@ describe('JsonlSessionPersistence: scanLog unit', () => {
     expect(() => { scanner.write(Buffer.from('null\n')) }).toThrow(/invalid committed event/)
   })
 
+  it('admits a repeated advertised tool-call id under recoverable recovery and refuses it under strict', () => {
+    const header = Buffer.from(`${JSON.stringify(toHeaderLine(meta('scanner-duplicate-tool-call')))}\n`)
+    const body = Buffer.from(`${[
+      { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
+      { type: 'step/start', seq: 1, time: 2, data: { turn: 1, step: 1 } },
+      {
+        type: 'assistant/message', seq: 2, time: 3, surfaceOp: 'append',
+        data: {
+          turn: 1, step: 1, stream: [],
+          message: {
+            id: 'assistant', role: 'assistant',
+            source: { kind: 'model', provider: 'mock', model: 'mock' },
+            content: [
+              { type: 'tool-call', id: 'call', name: 'read', arguments: '{}' },
+              { type: 'tool-call', id: 'call', name: 'read', arguments: '{}' },
+            ],
+          },
+        },
+      },
+    ].map(row => JSON.stringify(row)).join('\n')}\n`)
+
+    const recoverable = new SessionLogScanner(header)
+    recoverable.write(body)
+    expect(recoverable.finish().events).toHaveLength(3)
+
+    const strict = new SessionLogScanner(header, 'strict')
+    strict.write(body)
+    expect(() => strict.finish()).toThrow('assistant/message repeats advertised tool call call')
+  })
+
   it('expands valid stored source-event ranges', () => {
     const log = [
       JSON.stringify(toHeaderLine(meta('scanner-source-ranges'))),

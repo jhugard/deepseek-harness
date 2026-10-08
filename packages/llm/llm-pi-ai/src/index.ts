@@ -225,6 +225,12 @@ export function apply(ctx: Context, config: Config): void {
         + ` sending that message as provider-neutral content (${reason})`,
       )
     },
+    onDuplicateToolCallId: ({ provider, model, id, occurrence }) => {
+      ctx.logger.warn(
+        `llm-pi-ai: route "${provider}/${model}" issued tool call id ${id} more than once in one`
+        + ` assistant message; occurrence ${occurrence} is addressed as ${id}#${occurrence}`,
+      )
+    },
   })
   // Independent of the route set: signing in is what makes a route worth
   // adding, so the flows are offered before any profile names their provider.

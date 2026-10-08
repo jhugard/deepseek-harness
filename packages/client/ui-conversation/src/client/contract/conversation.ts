@@ -159,14 +159,6 @@ export interface ConversationNodeContext<State = unknown> {
   readonly key: string
   readonly kind: string
   readonly id: string
-  /**
-   * 0-based position of this Context among the occurrences the assembler
-   * opened for `id`. A Definition whose business id is reused (a provider
-   * re-issuing one tool-call id for parallel calls) yields one Context per
-   * occurrence, so a consumer can address one incarnation instead of always
-   * the first. Occurrence 0 is the Context keyed by the bare id.
-   */
-  readonly occurrence: number
   readonly matches: readonly ConversationMatch[]
   readonly start: ConversationStartMatch | undefined
   readonly state: State | undefined
@@ -247,25 +239,6 @@ export interface ConversationNodeDefinition<State = unknown> {
    */
   publication?(match: ConversationMatch): ConversationPublication
   /**
-   * Declare that a Match settles the occurrence it updates, so that a later
-   * Match for the same logical id opens a fresh occurrence instead of
-   * re-attaching to the closed one. Return true when the Match is terminal
-   * for the current occurrence (e.g. a tool result closes the call that
-   * started it). Default: false. Consulted only for update-role Matches and
-   * only when the Definition's logical id is reused across occurrences.
-   * @param match - accepted Match.
-   */
-  settle?(match: ConversationMatch): boolean
-  /**
-   * Return a per-occurrence identity for a Match, or null to keep it. A Match
-   * whose identity was already seen for the same logical id is skipped
-   * entirely (no start or update, publication 'none'), which drops
-   * re-emissions of an already-recorded event (e.g. a prune pass re-sending a
-   * tool result whose message.id was already applied). Default: null.
-   * @param match - accepted Match.
-   */
-  dedupe?(match: ConversationMatch): string | null
-  /**
    * Publish this Definition's read-only business value for one Location phase.
    * The Engine evaluates every Definition first for Step and then for Turn,
    * owns replacement/removal, and rejects another Context trying to publish
@@ -334,15 +307,11 @@ export interface ConversationViewBuilder<Node extends ConversationViewNode = Con
 export interface ConversationViewDefinition<Node extends ConversationViewNode = ConversationViewNode, Snapshot = unknown> {
   readonly target: string
   /**
-   * Address one occurrence of a tool call in this target's inspector; absent
-   * for non-inspection views.
+   * Address a tool call in this target's inspector; absent for non-inspection views.
    * @param callId - tool-call identity from the Session.
-   * @param occurrence - 0-based occurrence of that id, naming the incarnation
-   *   the caller addressed. A provider that re-issues one id for parallel calls
-   *   yields several incarnations.
    * @returns the target's opaque focus identity.
    */
-  toolCallFocus?(callId: string, occurrence: number): string
+  toolCallFocus?(callId: string): string
   /** @returns a new Session-owned incremental builder. */
   create(): ConversationViewBuilder<Node, Snapshot>
   /**

@@ -460,12 +460,14 @@ export class SessionLogScanner {
 
   /**
    * Finish scanning, ignoring a final record without a newline as a torn tail.
+   * Lifecycle relationship admission follows this scanner's recovery mode: `strict` refuses a
+   * tool-call id advertised more than once in one step, `recoverable` admits each occurrence.
    * @returns the header, contiguous event prefix, and safe truncation offset.
    */
   finish(): SessionLogScan {
     this.finished = true
     const artifact = this.restore.finish()
-    assertReleasedV4Relationships(artifact, KNOWN_SESSION_EVENT_TYPES)
+    assertReleasedV4Relationships(artifact, KNOWN_SESSION_EVENT_TYPES, this.recovery)
     return {
       meta: this.meta,
       inheritedEventCount: SessionLogOffset(artifact.inheritedEventCount),

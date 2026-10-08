@@ -27,25 +27,10 @@ interface Dependency {
   readonly windowGap: boolean
 }
 
-/**
- * One live incarnation of a logical Context id, tracked so that a Definition
- * whose business id is reused (e.g. a provider re-issuing the same tool-call
- * id for parallel calls) materializes each incarnation as its own Context
- * instead of collapsing them onto the first. Index 0 is the bare base key,
- * so a single-occurrence id keeps its existing byte-identical key.
- */
-interface OccurrenceRef {
-  readonly key: string
-  readonly occurrence: number
-  started: boolean
-  settled: boolean
-}
-
 interface InternalContext {
   readonly key: string
   readonly kind: string
   readonly id: string
-  readonly occurrence: number
   readonly definition: ConversationNodeDefinition
   startSeq: number | undefined
   start: ConversationStartMatch | undefined
@@ -60,7 +45,6 @@ interface InternalContext {
 interface PendingMatch {
   readonly definition: ConversationNodeDefinition
   readonly id: string
-  readonly occurrence: number
   readonly match: ConversationMatch
 }
 
@@ -119,7 +103,6 @@ function contextSnapshot<State>(context: InternalContext): ConversationNodeConte
     key: context.key,
     kind: context.kind,
     id: context.id,
-    occurrence: context.occurrence,
     matches: context.matches,
     start: context.start,
     state: context.state as State | undefined,
@@ -201,8 +184,6 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
   private readonly dependents = new Map<string, Set<InternalContext>>()
   private readonly views = new Map<string, ViewState>()
   private readonly groups = new Map<string, GroupState>()
-  private readonly occurrences = new Map<string, OccurrenceRef[]>()
-  private readonly dedupeSeen = new Map<string, Set<string>>()
   private readonly pendingGroupStores = new Set<ConversationGroupStore<unknown>>()
   private readonly activeTargets = new Set<string>()
   private hasMore = false
@@ -249,8 +230,6 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
     this.dirtyByTarget.clear()
     this.revised.clear()
     this.dependents.clear()
-    this.occurrences.clear()
-    this.dedupeSeen.clear()
     this.hasMore = hasMore
     const sorted = [...entries].sort((left, right) => left.event.seq - right.event.seq)
     for (const entry of sorted) this.inputs.set(entry.event.seq, entry)
@@ -477,107 +456,6 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
     return [...this.inputs.values()].sort((left, right) => left.event.seq - right.event.seq)
   }
 
-  /**
-   * Route one accepted Match to a Context occurrence.
-   *
-   * A Definition whose logical id is reused across the loaded history
-   * (typically a provider re-issuing the same tool-call id for parallel
-   * calls) splits into one Context per occurrence: occurrence 0 keeps the
-   * bare base key, so a single-occurrence id is byte-identical to before.
-   *
-   * Start-role Matches: when an occurrence is still open and unstarted (an
-   * earlier update leads it), complete it; otherwise re-affirm the first
-   * started, unsettled occurrence still anchored by a transient live start —
-   * the provider's per-call delta id repeats across that call's chunks, so a
-   * call's deltas share one anchor and its durable start re-confirms the
-   * same anchor; scanning open occurrences in order keeps each parallel
-   * call's start re-joining its own delta occurrence — and only when no open
-   * occurrence still expects a start, open a fresh one. Update-role Matches:
-   * attach to the first started, unsettled occurrence (recording a `settle`
-   * result so the next same-id Match opens fresh), then to the first
-   * still-open occurrence, and only then open a new one — so results pair
-   * with their calls in stream order.
-   *
-   * @returns the resolved occurrence, or null when the Match is dropped by the
-   * Definition's `dedupe` hook (re-emission of an already-seen identity).
-   */
-  private resolveOccurrence(
-    definition: ConversationNodeDefinition,
-    id: string,
-    match: ConversationMatch,
-  ): OccurrenceRef | null {
-    const baseKey = conversationContextKey(definition.kind, id)
-    const role = match.role
-    const dedupe = definition.dedupe
-    if (dedupe !== undefined) {
-      const token = dedupe(match)
-      if (token !== null) {
-        const seen = this.dedupeSeen.get(baseKey) ?? new Set<string>()
-        if (seen.has(token)) return null
-        seen.add(token)
-        this.dedupeSeen.set(baseKey, seen)
-      }
-    }
-    const refs = this.occurrences.get(baseKey)
-    if (refs === undefined) {
-      const first = { key: baseKey, occurrence: 0, started: role === 'start', settled: false }
-      this.occurrences.set(baseKey, [first])
-      return first
-    }
-    if (role === 'start') {
-      const unstarted = refs.find(ref => !ref.started)
-      if (unstarted !== undefined) {
-        unstarted.started = true
-        return unstarted
-      }
-      // A start re-affirms the first open occurrence still anchored by a
-      // transient live start, scanning in order so each parallel call's start
-      // re-joins its own delta occurrence. The provider's per-call delta id
-      // repeats across that call's chunks, so those deltas share the anchor;
-      // a durable start re-confirms the same anchor. A call whose delta was
-      // never seen (history loaded after settlement) opens a fresh occurrence
-      // because no open occurrence is live-anchored at that point.
-      for (const ref of refs) {
-        // Every ref survived the unstarted check above, so only settled
-        // occurrences can no longer re-affirm.
-        if (ref.settled) continue
-        const matches = this.contexts.get(ref.key)?.matches
-        if (matches === undefined) continue
-        let lastStartMatch: ConversationMatch | undefined
-        for (const candidate of matches) {
-          if (candidate.role === 'start') lastStartMatch = candidate
-        }
-        if (lastStartMatch !== undefined && lastStartMatch.event.type === 'assistant/live-chunk') {
-          return ref
-        }
-      }
-      const fresh = {
-        key: `${baseKey}#${refs.length}`,
-        occurrence: refs.length,
-        started: true,
-        settled: false,
-      }
-      refs.push(fresh)
-      return fresh
-    }
-    const openUnsettled = refs.find(ref => ref.started && !ref.settled)
-    if (openUnsettled !== undefined) {
-      const settle = definition.settle
-      if (settle !== undefined && settle(match) === true) openUnsettled.settled = true
-      return openUnsettled
-    }
-    const open = refs.find(ref => !ref.started)
-    if (open !== undefined) return open
-    const fresh = {
-      key: `${baseKey}#${refs.length}`,
-      occurrence: refs.length,
-      started: false,
-      settled: false,
-    }
-    refs.push(fresh)
-    return fresh
-  }
-
   private matchInput(input: SessionEventLikeEntry): ConversationPublication {
     // oxlint-disable-next-line typescript/unbound-method -- dispatchInput supplies the assembler receiver
     return this.dispatchInput(input, this.acceptMatch)
@@ -588,11 +466,10 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
     pending: Map<string, PendingMatch[]>,
   ): ConversationPublication {
     return this.dispatchInput(input, (definition, id, match) => {
-      const ref = this.resolveOccurrence(definition, id, match)
-      if (ref === null) return 'none'
-      const matches = pending.get(ref.key) ?? []
-      matches.push({ definition, id, occurrence: ref.occurrence, match })
-      pending.set(ref.key, matches)
+      const key = conversationContextKey(definition.kind, id)
+      const matches = pending.get(key) ?? []
+      matches.push({ definition, id, match })
+      pending.set(key, matches)
       return definition.publication?.(match) ?? 'immediate'
     })
   }
@@ -663,13 +540,11 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
     definition: ConversationNodeDefinition,
     id: string,
     key: string,
-    occurrence: number,
   ): InternalContext {
     const context: InternalContext = {
       key,
       kind: definition.kind,
       id,
-      occurrence,
       definition,
       startSeq: undefined,
       start: undefined,
@@ -690,11 +565,10 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
     id: string,
     match: ConversationMatch,
   ): ConversationPublication {
-    const ref = this.resolveOccurrence(definition, id, match)
-    if (ref === null) return 'none'
-    const key = ref.key
+    const latest = this.contextsByKind.get(definition.kind)?.at(-1)
+    const key = latest?.id === id ? latest.key : conversationContextKey(definition.kind, id)
     let context = this.contexts.get(key)
-    context ??= this.createContext(definition, id, key, ref.occurrence)
+    context ??= this.createContext(definition, id, key)
     const starting = match.role === 'start' && context.start === undefined
     const previous = context.matches.at(-1)
     if (previous !== undefined && previous.event.seq >= match.event.seq) {
@@ -736,7 +610,7 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
       const first = entries[0]
       if (first === undefined) continue
       let context = this.contexts.get(key)
-      context ??= this.createContext(first.definition, first.id, key, first.occurrence)
+      context ??= this.createContext(first.definition, first.id, key)
       const additions = entries
         .map((entry) => {
           if (entry.definition !== context.definition || entry.id !== context.id) {

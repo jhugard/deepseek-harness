@@ -37,7 +37,7 @@ function tool(key: string, seq: number, name = 'bash', owner = turn): ChatNode<'
   return {
     key, id: key, kind: 'tool-call', target: 'chat', anchorSeq: seq,
     location: { kind: 'turn', turn: owner }, visibility: 'visible',
-    data: { occurrence: 0, root: { phase: 'start' as const, args: PartialArguments.fromText('{"command":"pwd"}'), callId: key, name, argsRaw: '{"command":"pwd"}', turn: owner.turn, step: 1, time: seq, subCalls: [] } },
+    data: { root: { phase: 'start' as const, args: PartialArguments.fromText('{"command":"pwd"}'), callId: key, name, argsRaw: '{"command":"pwd"}', turn: owner.turn, step: 1, time: seq, subCalls: [] } },
   }
 }
 
@@ -95,7 +95,7 @@ describe('Definition-owned Chat process groups', () => {
     const node = tool('call', 2)
     const argsRaw = JSON.stringify({ command })
     const root = { ...node.data.root, argsRaw, args: PartialArguments.fromText(argsRaw) }
-    expect(processActivity([{ ...node, data: { root, occurrence: node.data.occurrence } }]).runningDetail).toBe(expected)
+    expect(processActivity([{ ...node, data: { root } }]).runningDetail).toBe(expected)
   })
 
   it('keeps 160 graphemes when the bounded prefix splits a surrogate pair', () => {
@@ -105,7 +105,7 @@ describe('Definition-owned Chat process groups', () => {
     const args = PartialArguments.fromText(argsRaw)
     const node: ChatNode<'tool-call'> = {
       ...tool('call', 2),
-      data: { occurrence: 0, root: { phase: 'start', argsRaw, args, callId: 'call', name: 'bash', turn: 1, step: 1, time: 2, subCalls: [] } },
+      data: { root: { phase: 'start', argsRaw, args, callId: 'call', name: 'bash', turn: 1, step: 1, time: 2, subCalls: [] } },
     }
     const prefix = vi.spyOn(args, 'textPrefix')
     const text = vi.spyOn(args, 'text')
@@ -125,7 +125,7 @@ describe('Definition-owned Chat process groups', () => {
     args.append(`{"command":"${command.slice(0, 511)}${escaped ? '\\ud83d' : command[511]}`)
     const node: ChatNode<'tool-call'> = {
       ...tool('call', 2),
-      data: { occurrence: 0, root: { phase: 'preparing', args, callId: 'call', name: 'bash', turn: 1, step: 1, time: 2, subCalls: [] } },
+      data: { root: { phase: 'preparing', args, callId: 'call', name: 'bash', turn: 1, step: 1, time: 2, subCalls: [] } },
     }
     expect(processActivity([node]).runningDetail).toBe(command.slice(0, 511))
     args.append(escaped ? '\\udcbb' : command[512]!)
@@ -142,7 +142,7 @@ describe('Definition-owned Chat process groups', () => {
     args.append(`{"command":"${command}`)
     const node: ChatNode<'tool-call'> = {
       ...tool('call', 2),
-      data: { occurrence: 0, root: { phase: 'preparing', args, callId: 'call', name: 'bash', turn: 1, step: 1, time: 2, subCalls: [] } },
+      data: { root: { phase: 'preparing', args, callId: 'call', name: 'bash', turn: 1, step: 1, time: 2, subCalls: [] } },
     }
     expect(processActivity([node]).runningDetail).toBe(command.slice(0, -1))
     args.append(ending)
@@ -155,7 +155,7 @@ describe('Definition-owned Chat process groups', () => {
     args.append(`{"command":"${'x'.repeat(1024)}`)
     const node: ChatNode<'tool-call'> = {
       ...tool('call', 2),
-      data: { occurrence: 0, root: { phase: 'preparing', args, callId: 'call', name: 'bash', turn: 1, step: 1, time: 2, subCalls: [] } },
+      data: { root: { phase: 'preparing', args, callId: 'call', name: 'bash', turn: 1, step: 1, time: 2, subCalls: [] } },
     }
     const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
     const segment = segmenter.segment.bind(segmenter)
@@ -190,7 +190,7 @@ describe('Definition-owned Chat process groups', () => {
   it('clears preparation from a closed group while retaining its recorded activity', () => {
     const preparing: ChatNode<'tool-call'> = {
       ...tool('call', 2, 'write'),
-      data: { occurrence: 0, root: { phase: 'preparing', args: PartialArguments.EMPTY, callId: 'call', name: 'write', turn: 1, step: 1, time: 2, subCalls: [] } },
+      data: { root: { phase: 'preparing', args: PartialArguments.EMPTY, callId: 'call', name: 'write', turn: 1, step: 1, time: 2, subCalls: [] } },
     }
     const h = harness([preparing])
     const group = h.store.entries[0]!
@@ -214,7 +214,7 @@ describe('Definition-owned Chat process groups', () => {
     const args = new PartialArguments()
     const preparing: ChatNode<'tool-call'> = {
       ...started,
-      data: { occurrence: 0, root: { phase: 'preparing', args, callId: 'call', name, turn: 1, step: 1, time: 2, subCalls: [] } },
+      data: { root: { phase: 'preparing', args, callId: 'call', name, turn: 1, step: 1, time: 2, subCalls: [] } },
     }
     const h = harness([preparing])
     const group = h.store.entries[0]!
@@ -224,7 +224,7 @@ describe('Definition-owned Chat process groups', () => {
       counts: [{ kind, count: 1 }], running: kind, preparing: true, runningDetail: '',
     })
     args.append('{}')
-    h.builder.apply({ upserts: [{ ...preparing, data: { occurrence: 0, root: { ...preparing.data.root } } }], timeline })
+    h.builder.apply({ upserts: [{ ...preparing, data: { root: { ...preparing.data.root } } }], timeline })
     h.commit()
     expect(source.getSnapshot()?.data.summary.runningDetail).toBe(name)
     h.builder.apply({ upserts: [started], timeline })
@@ -232,7 +232,7 @@ describe('Definition-owned Chat process groups', () => {
     expect(source.getSnapshot()?.data.summary).toEqual({ counts: [{ kind, count: 1 }], running: kind, runningDetail: 'pwd' })
     const settled: ChatNode<'tool-call'> = {
       ...started,
-      data: { occurrence: 0, root: {
+      data: { root: {
         kind: 'tool-result', callId: 'call', seq: 3, time: 3, callTime: 2,
         name, args: PartialArguments.fromText('{"command":"pwd"}'),
         call: { name, argsRaw: '{"command":"pwd"}' }, content: [], isError: false, subCalls: [],
@@ -451,7 +451,7 @@ describe('Definition-owned Chat process groups', () => {
     const previous = h.store.groupSource(history.key).getSnapshot()
     const live = tool('live', 4)
     h.builder.apply({
-      upserts: [{ ...live, data: { occurrence: 0, root: { ...live.data.root, argsRaw: '{"command":"ls"}', args: PartialArguments.fromText('{"command":"ls"}') } } }],
+      upserts: [{ ...live, data: { root: { ...live.data.root, argsRaw: '{"command":"ls"}', args: PartialArguments.fromText('{"command":"ls"}') } } }],
       timeline,
     })
     const input = h.builder.groupInput()

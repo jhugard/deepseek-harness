@@ -36,13 +36,6 @@ export interface ReleasedRelationshipExtensions {
   readonly preservedSourceTitleRequestText?: true
   /** Admit the released resume pattern whose next-turn inbox insert omitted the prior turn/end. */
   readonly legacyInterruptedTurnRestart?: true
-  /**
-   * Local patch: admit a tool-call id advertised more than once within one step. Local
-   * OpenAI-compatible servers re-emit one call under the same composed id across output_index
-   * slots; each occurrence still needs its own tool/call and tool/result, matched in stream
-   * order.
-   */
-  readonly allowDuplicateAdvertisedToolCall?: true
 }
 
 /**
@@ -66,9 +59,11 @@ export function assertReleasedArtifactRelationships(
   const retryStarts = new Set<string>()
   const ptcRoots = new Map<string, string>()
   const ptcStarts = new Map<string, PtcStart>()
-  // Each advertised id maps to its occurrences; duplicate ids (local OpenAI-compatible servers
-  // re-emit one call under the same id) are admitted when the extension is set and resolved in
-  // stream order.
+  // Each advertised id maps to its occurrences in advertisement order. A repeated id is admitted:
+  // no released writer ever enforced uniqueness, and refusing a historical log here would block
+  // its migration permanently. Each occurrence still requires its own tool/call and tool/result,
+  // matched in stream order: a tool/call takes the earliest unstarted occurrence, a result the
+  // earliest started one, or the earliest unstarted one when none started.
   const toolLifecycles = new Map<string, ToolLifecycle[]>()
   const commandRuns = new Set<string>()
 
@@ -146,22 +141,14 @@ export function assertReleasedArtifactRelationships(
         for (const block of content) {
           if (block['type'] !== 'tool-call') continue
           const callId = block['id'] as string
-          const existing = toolLifecycles.get(callId)
-          if (existing === undefined) {
-            toolLifecycles.set(callId, [{
-              name: block['name'] as string,
-              arguments: block['arguments'] as string,
-              state: 'advertised',
-            }])
-          } else if (extensions.allowDuplicateAdvertisedToolCall === true) {
-            existing.push({
-              name: block['name'] as string,
-              arguments: block['arguments'] as string,
-              state: 'advertised',
-            })
-          } else {
-            throw new SessionFormatError(`assistant/message repeats advertised tool call ${callId}`)
+          const occurrence: ToolLifecycle = {
+            name: block['name'] as string,
+            arguments: block['arguments'] as string,
+            state: 'advertised',
           }
+          const existing = toolLifecycles.get(callId)
+          if (existing === undefined) toolLifecycles.set(callId, [occurrence])
+          else existing.push(occurrence)
         }
         break
       }
@@ -193,9 +180,8 @@ export function assertReleasedArtifactRelationships(
           if (lifecycle.state === 'advertised' && !isExactToolNotStartedRepair(event, content, error)) {
             throw new SessionFormatError(`tool/result ${callId} is not the exact TOOL_NOT_STARTED repair`)
           }
-          const remaining = group.filter(candidate => candidate !== lifecycle)
-          if (remaining.length === 0) toolLifecycles.delete(callId)
-          else toolLifecycles.set(callId, remaining)
+          group.splice(group.indexOf(lifecycle), 1)
+          if (group.length === 0) toolLifecycles.delete(callId)
         } else if (openTurn === null) {
           throw new SessionFormatError('tool/result replacement is outside an open turn')
         }

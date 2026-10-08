@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { Session, SessionId, SessionLogOffset, interruptedTurnClosers, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
 import { sessionFormatCatalog } from '@deepseek-ai/dsh-session-format-catalog'
-import type { SessionFormatEvent } from '@deepseek-ai/dsh-session-format'
+import type { SessionFormatArtifact, SessionFormatEvent } from '@deepseek-ai/dsh-session-format'
+import { assertReleasedV4Relationships } from '../src/index.ts'
 
 type Row = { type: string; data: Record<string, unknown>; surfaceOp?: unknown; sourceEventSeqs?: number[]; ignorable?: true }
 const row = (type: string, data: Record<string, unknown>): Row => ({ type, data })
@@ -78,6 +79,20 @@ describe('mandatory V4 lifecycle restoration', () => {
     )
     expect(closers.map(event => event.type)).toEqual(['tool/result', 'tool/result', 'step/end', 'turn/end'])
     expect(() => reopen([...openTail, ...closers])).not.toThrow()
+  })
+
+  it('refuses a repeated advertised id under strict relationship admission', () => {
+    const events = [...begin(), assistant([call, call])]
+      .map((candidate, seq) => ({ ...candidate, seq, time: seq + 1 }) as unknown as SessionFormatEvent)
+    const artifact: SessionFormatArtifact = {
+      header: { version: 4, id: 'native-relations', createdAt: 1, delegationDepth: 0, isSeeded: false },
+      inheritedEventCount: 0,
+      events,
+    }
+    const known = new Set(events.map(event => event.type))
+    expect(() => assertReleasedV4Relationships(artifact, known, 'strict'))
+      .toThrow('assistant/message repeats advertised tool call call')
+    expect(() => assertReleasedV4Relationships(artifact, known, 'recoverable')).not.toThrow()
   })
 
   it.each([

@@ -47,7 +47,7 @@ function props(
       anchorSeq: 'seq' in block ? block.seq : 0,
       location: { kind: 'session' },
       visibility: 'visible',
-      data: { root: block, occurrence: 0 },
+      data: { root: block },
     },
     openFile: vi.fn(),
     openSkill: vi.fn(),
@@ -73,7 +73,7 @@ describe('ToolCallTree', () => {
     owners.length = 0
     const changed = { ...children[42]!, isError: true }
     const next = { ...block, subCalls: children.map((child, index) => index === 42 ? changed : child) }
-    view.rerender(<ToolCallTree {...initial} node={{ ...initial.node, data: { root: next, occurrence: 0 } }} />)
+    view.rerender(<ToolCallTree {...initial} node={{ ...initial.node, data: { root: next } }} />)
     expect(owners.map(owner => owner.callId)).toEqual(['parent', 'child-42'])
   })
 
@@ -177,25 +177,7 @@ describe('ToolCallTree', () => {
     const inspect = owners[0]?.inspect
     expect(inspect).toBeDefined()
     inspect?.()
-    expect(treeProps.inspectCall).toHaveBeenCalledExactlyOnceWith('running', 0)
-  })
-
-  it('forwards the node occurrence to inspect so a reused id addresses its own row', () => {
-    const owners: ToolCallOwnerProps[] = []
-    const block: ToolCallBlock = {
-      phase: 'start' as const, args: PartialArguments.fromText('{"command":"pwd"}'), callId: 'dup', name: 'bash', argsRaw: '{"command":"pwd"}',
-      turn: 1, step: 0, time: 1_000, subCalls: [],
-    }
-    const treeProps = props(block, undefined, owners)
-    render(
-      <ToolCallTree
-        {...treeProps}
-        node={{ ...treeProps.node, data: { root: block, occurrence: 2 } }}
-      />,
-    )
-
-    owners[0]?.inspect?.()
-    expect(treeProps.inspectCall).toHaveBeenCalledExactlyOnceWith('dup', 2)
+    expect(treeProps.inspectCall).toHaveBeenCalledExactlyOnceWith('running')
   })
 
   it('abbreviates a POSIX home path in the generic tool summary', () => {

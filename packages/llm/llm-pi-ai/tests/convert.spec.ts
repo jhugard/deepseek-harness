@@ -815,6 +815,85 @@ describe('toStreamChunks', () => {
     ])
   })
 
+  it('gives each occurrence of one repeated tool-call id a distinct harness id', async () => {
+    // A llama.cpp-style Responses server re-emits one call under the same `call_id` and `id`, so
+    // pi-ai composes byte-identical ids for two distinct output items.
+    const duplicated = assistant({
+      content: [
+        { type: 'toolCall', id: 'call_dup|fc_dup', name: 'pwsh', arguments: {} },
+        { type: 'toolCall', id: 'call_dup|fc_dup', name: 'glob', arguments: {} },
+      ],
+    })
+    const reported = vi.fn()
+    const chunks = await collect(toStreamChunks(feed(
+      { type: 'toolcall_start', contentIndex: 0, partial: duplicated },
+      { type: 'toolcall_delta', contentIndex: 0, delta: '{"command"', partial: duplicated },
+      { type: 'toolcall_start', contentIndex: 1, partial: duplicated },
+      { type: 'toolcall_delta', contentIndex: 1, delta: '{"pattern"', partial: duplicated },
+      { type: 'toolcall_delta', contentIndex: 0, delta: ':"pwd"}', partial: duplicated },
+      { type: 'toolcall_delta', contentIndex: 1, delta: ':"*.ts"}', partial: duplicated },
+      {
+        type: 'toolcall_end',
+        contentIndex: 0,
+        toolCall: { type: 'toolCall', id: 'call_dup|fc_dup', name: 'pwsh', arguments: { command: 'pwd' } },
+        partial: duplicated,
+      },
+      {
+        type: 'toolcall_end',
+        contentIndex: 1,
+        toolCall: { type: 'toolCall', id: 'call_dup|fc_dup', name: 'glob', arguments: { pattern: '*.ts' } },
+        partial: duplicated,
+      },
+      { type: 'done', reason: 'toolUse', message: assistant({ content: duplicated.content, stopReason: 'toolUse' }) },
+    ), undefined, undefined, undefined, reported))
+    expect(chunks.filter(chunk => chunk.type === 'tool-call-delta')).toEqual([
+      { type: 'tool-call-delta', index: 0, id: 'call_dup|fc_dup', name: 'pwsh', argumentsDelta: '{"command"' },
+      { type: 'tool-call-delta', index: 1, id: 'call_dup|fc_dup#2', name: 'glob', argumentsDelta: '{"pattern"' },
+      { type: 'tool-call-delta', index: 0, id: 'call_dup|fc_dup', name: 'pwsh', argumentsDelta: ':"pwd"}' },
+      { type: 'tool-call-delta', index: 1, id: 'call_dup|fc_dup#2', name: 'glob', argumentsDelta: ':"*.ts"}' },
+    ])
+    expect(chunks.filter(chunk => chunk.type === 'block-end')).toEqual([
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_dup|fc_dup', name: 'pwsh', arguments: '{"command":"pwd"}' } },
+      { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'call_dup|fc_dup#2', name: 'glob', arguments: '{"pattern":"*.ts"}' } },
+    ])
+    expect(reported).toHaveBeenCalledOnce()
+    expect(reported).toHaveBeenCalledWith({ id: 'call_dup|fc_dup', occurrence: 2 })
+  })
+
+  it('leaves a turn whose tool-call ids are distinct untouched', async () => {
+    const distinct = assistant({
+      content: [
+        { type: 'toolCall', id: 'call_a|fc_a', name: 'pwsh', arguments: {} },
+        { type: 'toolCall', id: 'call_b|fc_b', name: 'glob', arguments: {} },
+      ],
+    })
+    const reported = vi.fn()
+    const chunks = await collect(toStreamChunks(feed(
+      { type: 'toolcall_start', contentIndex: 0, partial: distinct },
+      { type: 'toolcall_delta', contentIndex: 0, delta: '{}', partial: distinct },
+      { type: 'toolcall_start', contentIndex: 1, partial: distinct },
+      { type: 'toolcall_delta', contentIndex: 1, delta: '{}', partial: distinct },
+      {
+        type: 'toolcall_end',
+        contentIndex: 0,
+        toolCall: { type: 'toolCall', id: 'call_a|fc_a', name: 'pwsh', arguments: {} },
+        partial: distinct,
+      },
+      {
+        type: 'toolcall_end',
+        contentIndex: 1,
+        toolCall: { type: 'toolCall', id: 'call_b|fc_b', name: 'glob', arguments: {} },
+        partial: distinct,
+      },
+      { type: 'done', reason: 'toolUse', message: assistant({ content: distinct.content, stopReason: 'toolUse' }) },
+    ), undefined, undefined, undefined, reported))
+    expect(chunks.filter(chunk => chunk.type === 'block-end')).toEqual([
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_a|fc_a', name: 'pwsh', arguments: '{}' } },
+      { type: 'block-end', index: 1, block: { type: 'tool-call', id: 'call_b|fc_b', name: 'glob', arguments: '{}' } },
+    ])
+    expect(reported).not.toHaveBeenCalled()
+  })
+
   it('tolerates toolcall_start with a missing partial entry', async () => {
     const chunks = await collect(toStreamChunks(feed(
       { type: 'toolcall_start', contentIndex: 0, partial: assistant() },

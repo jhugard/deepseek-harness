@@ -218,7 +218,7 @@ describe('Conversation inject API', () => {
     const inspect = source.getSnapshot()!
     expect(inspect).toBeTypeOf('function')
     expect(source.getSnapshot()).toBe(inspect)
-    inspect('call-1', 0)
+    inspect('call-1')
     expect(body.instance.store.getSnapshot().viewRequest).toEqual({ view: 'trajectory', focus: 'tool:call-1' })
     await b.runtime.ctx.configForms.developerTools.setEnabled(false)
     expect(source.getSnapshot()).toBeUndefined()
@@ -239,7 +239,7 @@ describe('Conversation inject API', () => {
     await b.runtime.ctx.configForms.developerTools.setEnabled(false)
     const pipelineInspect = source.getSnapshot()!
     expect(pipelineInspect).toBeTypeOf('function')
-    pipelineInspect('call-2', 0)
+    pipelineInspect('call-2')
     expect(body.instance.store.getSnapshot().viewRequest).toEqual({ view: 'pipeline', focus: 'stage:call-2' })
     await b.runtime.ctx.configForms.developerTools.setEnabled(true)
     removePipelineView()
@@ -249,7 +249,7 @@ describe('Conversation inject API', () => {
     removeView()
     await b.runtime.flush()
     expect(source.getSnapshot()).toBeUndefined()
-    inspect('stale-call', 0)
+    inspect('stale-call')
     expect(body.instance.store.getSnapshot().viewRequest?.focus).not.toBe('tool:stale-call')
     expect(changed).toHaveBeenCalled()
     unsubscribe()

@@ -128,6 +128,44 @@ export function mapStopReason(message: AssistantMessage, contextWindow?: number)
 }
 
 /**
+ * Suffix that separates the Nth occurrence of one tool-call id within a turn from the id the
+ * provider issued.
+ */
+const DUPLICATE_TOOL_CALL_SUFFIX = '#'
+
+/**
+ * Give each tool call in one assistant turn a distinct harness id.
+ *
+ * pi-ai composes the Responses tool-call id as `` `${call_id}|${item.id}` `` and keys its output
+ * slots on `output_index`, so a Responses server that re-emits one call under the same ids
+ * (llama.cpp-style local servers) yields byte-identical harness ids for distinct calls. The
+ * harness addresses tool calls by id, so every occurrence after the first gains a `#<n>` suffix.
+ *
+ * The suffix does not disturb the provider round trip. The Responses adapter sends only the part
+ * before the first `|` as `call_id`, so the provider receives the id it issued. The Chat
+ * Completions adapter maps the assistant tool-call id and the tool-result id through the same
+ * `normalizeToolCallId`, so the pair the provider sees stays consistent.
+ * @param id - tool-call id exactly as pi-ai reported it.
+ * @param issued - per-turn count of ids already handed out, updated in place.
+ * @returns the id for this occurrence: unchanged for the first, suffixed with its 1-based
+ *   occurrence number for each later one.
+ */
+function distinctToolCallId(id: string, issued: Map<string, number>): string {
+  if (id === '') return id
+  const seen = issued.get(id) ?? 0
+  issued.set(id, seen + 1)
+  return seen === 0 ? id : `${id}${DUPLICATE_TOOL_CALL_SUFFIX}${seen + 1}`
+}
+
+/** One tool-call id a provider issued more than once within one assistant turn. */
+export interface DuplicateToolCallId {
+  /** Id exactly as the provider issued it, without the harness suffix. */
+  readonly id: string
+  /** 1-based occurrence that received the suffix. */
+  readonly occurrence: number
+}
+
+/**
  * Translate the pi-ai event stream into StreamChunks. pi-ai never throws
  * mid-stream — failures arrive as `error` events, which become error/aborted
  * `finish` chunks (the harness protocol's other error-delivery style).
@@ -136,6 +174,7 @@ export function mapStopReason(message: AssistantMessage, contextWindow?: number)
  * @param callerSignal - caller cancellation state; an aborted caller makes any
  *   in-band terminal error an aborted finish.
  * @param requestedModel - request model identity recorded for durable replay.
+ * @param onDuplicateToolCallId - observes each occurrence the adapter disambiguates.
  * @returns the harness chunks, ending with `usage` then `finish`; throws
  *   `LlmError` (`STREAM_CLOSED`) if the source ends without a terminal event.
  */
@@ -144,10 +183,12 @@ export async function* toStreamChunks(
   contextWindow?: number,
   callerSignal?: AbortSignal,
   requestedModel?: string,
+  onDuplicateToolCallId?: (detail: DuplicateToolCallId) => void,
 ): AsyncGenerator<StreamChunk> {
   // pi-ai contentIndex ↔ our block index map 1:1 (both count blocks from 0
   // in stream order), but we track ids per index for tool calls.
   const toolIds = new Map<number, { id: string; name: string }>()
+  const issuedToolCallIds = new Map<string, number>()
 
   for await (const event of events) {
     switch (event.type) {
@@ -174,8 +215,12 @@ export async function* toStreamChunks(
       case 'toolcall_start': {
         // The id/name live on the partial's content at this index.
         const partial = event.partial.content[event.contentIndex]
-        const id = partial?.type === 'toolCall' ? partial.id : ''
+        const issued = partial?.type === 'toolCall' ? partial.id : ''
         const name = partial?.type === 'toolCall' ? partial.name : ''
+        const id = distinctToolCallId(issued, issuedToolCallIds)
+        if (id !== issued) {
+          onDuplicateToolCallId?.({ id: issued, occurrence: issuedToolCallIds.get(issued) ?? 1 })
+        }
         toolIds.set(event.contentIndex, { id, name })
         yield { type: 'block-start', index: event.contentIndex, blockType: 'tool-call' }
         break
@@ -197,7 +242,9 @@ export async function* toStreamChunks(
           index: event.contentIndex,
           block: {
             type: 'tool-call',
-            id: brandString<ToolCallId>(event.toolCall.id),
+            // The tracked id is the one every delta of this call carried, so the assembled block
+            // and its deltas keep one identity.
+            id: brandString<ToolCallId>(toolIds.get(event.contentIndex)?.id ?? event.toolCall.id),
             name: event.toolCall.name,
             // pi-ai hands back the PARSED arguments; the harness vocabulary
             // keeps the raw string.

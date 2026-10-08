@@ -327,8 +327,6 @@ export const toolDefinition: ConversationNodeDefinition<ToolState> = {
     return updateDispatch(context.state, match)
   },
   publication: match => match.event.type === 'assistant/live-chunk' ? 'animation-frame' : 'immediate',
-  settle: match => match.event.type === 'tool/result',
-  dedupe: match => match.event.type === 'tool/result' ? String(match.event.data.message.id) : null,
   buildViewNode: (context) => {
     const current = context.current.get('chat') as ChatNode<'tool-call'> | null | undefined
     const state = context.state ?? fallbackState(context)
@@ -345,9 +343,7 @@ export const toolDefinition: ConversationNodeDefinition<ToolState> = {
     const preparing = !('kind' in projected) && projected.phase === 'preparing'
     const visibility = preparing && interruptedAt !== undefined ? 'hidden' : 'visible'
     const location = contextLocation(context)
-    const data = current?.data.root === projected
-      ? current.data
-      : { root: projected, occurrence: context.occurrence } satisfies ToolChatData
+    const data = current?.data.root === projected ? current.data : { root: projected } satisfies ToolChatData
     if (current?.data === data && current.anchorSeq === anchor
       && current.visibility === visibility && current.location === location) return current
     return chatNode(context, 'tool-call', anchor, data, { visibility, location })

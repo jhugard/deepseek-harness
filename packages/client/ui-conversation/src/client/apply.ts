@@ -367,9 +367,9 @@ export function apply(ctx: Context, config: Config = Config({})): void {
         definition.toolCallFocus !== undefined
         && conversationViews.getSnapshot().some(view => view.id === definition.target),
       )
-      const inspectCall = (callId: string, occurrence: number): void => {
+      const inspectCall = (callId: string): void => {
         const target = inspectionTarget()
-        if (target?.toolCallFocus !== undefined) openView(target.target, target.toolCallFocus(callId, occurrence))
+        if (target?.toolCallFocus !== undefined) openView(target.target, target.toolCallFocus(callId))
       }
       return {
         hooks: {

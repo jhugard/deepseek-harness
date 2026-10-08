@@ -1877,7 +1877,7 @@ describe('ConversationNodeAssembler', () => {
     )).toThrow(/Definition "undefined-update" returned undefined from update/)
   })
 
-  it('opens a fresh occurrence for each reused start Match and routes the prepended one to a third', () => {
+  it('updates the same Context for later start matches and reselects an earlier prepended start', () => {
     const start = vi.fn((_context: ConversationNodeContext<number[]>, match: ConversationMatch) => [match.event.seq])
     const update = vi.fn((context: { state: number[] }, match: ConversationMatch) => [...context.state, match.event.seq])
     const definition: ConversationNodeDefinition<number[]> = {
@@ -1901,191 +1901,12 @@ describe('ConversationNodeAssembler', () => {
       input(at(SessionSeq(2), 'command/run', { commandId: 'two', name: 'x' })),
     )
     assembler.flush()
-    // The reused id opened a second occurrence; no update applied because the
-    // second occurrence is a start-only Context.
-    expect(start).toHaveBeenCalledTimes(2)
-    expect(update).not.toHaveBeenCalled()
-    const snapshot = testSnapshot(assembler)
-    expect(snapshot?.order).toEqual(['12:single-startone', '12:single-startone#1'])
-    expect([...(snapshot?.nodes.values() ?? [])].map(value => value.data)).toEqual([[1], [2]])
-
+    expect(start).toHaveBeenCalledOnce()
+    expect(update).toHaveBeenCalledOnce()
+    expect([...testSnapshot(assembler)?.nodes.values() ?? []][0]?.data).toEqual([1, 2])
     assembler.prepend([input(at(SessionSeq(0), 'command/run', { commandId: 'zero', name: 'x' }))], false)
     assembler.flush()
-    expect(start).toHaveBeenCalledTimes(3)
-    expect(update).not.toHaveBeenCalled()
-    const ordered = testSnapshot(assembler)
-    expect(ordered?.order).toEqual([
-      '12:single-startone',
-      '12:single-startone#1',
-      '12:single-startone#2',
-    ])
-    expect([...(ordered?.nodes.values() ?? [])].map(value => value.data)).toEqual([[1], [2], [0]])
-  })
-
-  function duplicatedToolDefinition(
-    hooks: Partial<Pick<ConversationNodeDefinition<string>, 'settle' | 'dedupe'>> = {},
-  ): ConversationNodeDefinition<string> {
-    return {
-      kind: 'tool',
-      match: (event) => {
-        if (event.type === 'assistant/live-chunk' && event.data.chunk.type === 'tool-call-delta') {
-          return { id: String(event.data.chunk.id), role: 'start' }
-        }
-        if (event.type === 'tool/call') return { id: String(event.data.callId), role: 'start' }
-        if (event.type === 'tool/result') return { id: String(event.data.message.source.callId), role: 'update' }
-        return null
-      },
-      start: (_context, match) => `start@${match.event.seq}`,
-      update: (context, match) => `${context.state}+r${match.event.seq}`,
-      target: 'test',
-      buildViewNode: context => node(context, context.state),
-      ...hooks,
-    }
-  }
-
-  function duplicatedCall(seq: number): SessionLiveEventEntry {
-    return input(at(SessionSeq(seq), 'tool/call', { turn: 1, step: 1, callId: 'dup', name: 'x', arguments: '{}' }))
-  }
-
-  function duplicatedResult(seq: number, messageId: string): SessionLiveEventEntry {
-    return input(at(SessionSeq(seq), 'tool/result', {
-      turn: 1,
-      step: 1,
-      message: { id: messageId, source: { type: 'tool-result', callId: 'dup' }, content: [], isError: false },
-    }))
-  }
-
-  function duplicateAssembler(
-    hooks: Partial<Pick<ConversationNodeDefinition<string>, 'settle' | 'dedupe'>> = {},
-  ): ConversationNodeAssembler {
-    return new ConversationNodeAssembler(
-      new TestEventDefinitions([duplicatedToolDefinition(hooks)]),
-      new TestViewDefinitions([testView()]),
-    )
-  }
-
-  it('pairs interleaved same-id call/result streams by settling each result onto its call', () => {
-    const assembler = duplicateAssembler({
-      settle: match => match.event.type === 'tool/result',
-      dedupe: match => match.event.type === 'tool/result' ? String(match.event.data.message.id) : null,
-    })
-    assembler.replaceWindow([
-      duplicatedCall(1), duplicatedResult(2, 'r1'),
-      duplicatedCall(3), duplicatedResult(4, 'r2'),
-    ], false)
-    assembler.flush()
-    const snapshot = testSnapshot(assembler)
-    expect(snapshot?.order).toEqual(['4:tooldup', '4:tooldup#1'])
-    expect([...(snapshot?.nodes.values() ?? [])].map(value => value.data)).toEqual([
-      'start@1+r2',
-      'start@3+r4',
-    ])
-  })
-
-  it('pairs back-to-back same-id calls with their results in stream order', () => {
-    const assembler = duplicateAssembler({
-      settle: match => match.event.type === 'tool/result',
-      dedupe: match => match.event.type === 'tool/result' ? String(match.event.data.message.id) : null,
-    })
-    assembler.replaceWindow([
-      duplicatedCall(1), duplicatedCall(2),
-      duplicatedResult(3, 'r1'), duplicatedResult(4, 'r2'),
-    ], false)
-    assembler.flush()
-    const snapshot = testSnapshot(assembler)
-    expect(snapshot?.order).toEqual(['4:tooldup', '4:tooldup#1'])
-    expect([...(snapshot?.nodes.values() ?? [])].map(value => value.data)).toEqual([
-      'start@1+r3',
-      'start@2+r4',
-    ])
-  })
-
-  it('drops a re-emitted result whose message identity was already seen', () => {
-    const assembler = duplicateAssembler({
-      settle: match => match.event.type === 'tool/result',
-      dedupe: match => match.event.type === 'tool/result' ? String(match.event.data.message.id) : null,
-    })
-    assembler.replaceWindow([
-      duplicatedCall(1), duplicatedResult(2, 'm1'),
-    ], false)
-    assembler.flush()
-
-    // A prune re-emission repeats the result's message.id; it must be skipped entirely.
-    expect(assembler.append(duplicatedResult(3, 'm1'))).toBe('none')
-    assembler.flush()
-    const snapshot = testSnapshot(assembler)
-    expect(snapshot?.order).toEqual(['4:tooldup'])
-    expect([...(snapshot?.nodes.values() ?? [])].map(value => value.data)).toEqual(['start@1+r2'])
-  })
-
-  it('keeps every result when the Definition reports no dedupe identity', () => {
-    const assembler = duplicateAssembler({ dedupe: () => null })
-    assembler.replaceWindow([
-      duplicatedCall(1),
-      duplicatedResult(2, 'm1'), duplicatedResult(3, 'm2'),
-    ], false)
-    assembler.flush()
-    const snapshot = testSnapshot(assembler)
-    expect(snapshot?.order).toEqual(['4:tooldup'])
-    expect([...(snapshot?.nodes.values() ?? [])].map(value => value.data)).toEqual(['start@1+r2+r3'])
-  })
-
-  it('re-affirms a durable start onto the live-chunk occurrence and splits a second reused call', () => {
-    const hooks: Pick<ConversationNodeDefinition<string>, 'settle' | 'dedupe'> = {
-      settle: match => match.event.type === 'tool/result',
-      dedupe: match => match.event.type === 'tool/result' ? String(match.event.data.message.id) : null,
-    }
-    const delta = (seq: number) => transientChunk(seq, 1, 1, {
-      type: 'tool-call-delta', index: 0, id: ToolCallId('dup'), name: 'write', argumentsDelta: '',
-    })
-
-    const one = duplicateAssembler(hooks)
-    one.replaceWindow([], false)
-    one.append(delta(1.1))
-    one.append(duplicatedCall(2))
-    one.flush()
-    // The durable start re-joins the transient-anchored occurrence and is
-    // applied through update, per the start-reaffirmation contract.
-    const single = testSnapshot(one)
-    expect(single?.order).toEqual(['4:tooldup'])
-    expect([...(single?.nodes.values() ?? [])].map(value => value.data)).toEqual(['start@1.1+r2'])
-
-    const two = duplicateAssembler(hooks)
-    two.replaceWindow([], false)
-    two.append(delta(1.1))
-    two.append(duplicatedCall(2))
-    two.append(duplicatedCall(3))
-    two.append(duplicatedResult(4, 'r1'))
-    two.append(duplicatedResult(5, 'r2'))
-    two.flush()
-    const split = testSnapshot(two)
-    expect(split?.order).toEqual(['4:tooldup', '4:tooldup#1'])
-    expect([...(split?.nodes.values() ?? [])].map(value => value.data)).toEqual([
-      'start@1.1+r2+r4',
-      'start@3+r5',
-    ])
-  })
-
-  it('publishes each occurrence index on the Context it hands the Definition', () => {
-    const assembler = new ConversationNodeAssembler(
-      new TestEventDefinitions([{
-        ...duplicatedToolDefinition({
-          settle: match => match.event.type === 'tool/result',
-          dedupe: match => match.event.type === 'tool/result' ? String(match.event.data.message.id) : null,
-        }),
-        buildViewNode: context => node(context, `${context.id}#${context.occurrence}`),
-      }]),
-      new TestViewDefinitions([testView()]),
-    )
-    assembler.replaceWindow([
-      duplicatedCall(1), duplicatedCall(2), duplicatedCall(3),
-      duplicatedResult(4, 'r1'), duplicatedResult(5, 'r2'), duplicatedResult(6, 'r3'),
-    ], false)
-    assembler.flush()
-    const snapshot = testSnapshot(assembler)
-    expect(snapshot?.order).toEqual(['4:tooldup', '4:tooldup#1', '4:tooldup#2'])
-    expect([...(snapshot?.nodes.values() ?? [])].map(value => value.data)).toEqual([
-      'dup#0', 'dup#1', 'dup#2',
-    ])
+    expect(start).toHaveBeenCalledTimes(2)
+    expect([...testSnapshot(assembler)?.nodes.values() ?? []][0]?.data).toEqual([0, 1, 2])
   })
 })

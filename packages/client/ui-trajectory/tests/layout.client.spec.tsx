@@ -12,10 +12,8 @@ import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 import { TrajectoryGroupHeader } from '../src/client/TrajectoryGroupHeader.tsx'
 import { TrajectoryTurn } from '../src/client/TrajectoryTurn.tsx'
 import { TrajectoryTurnHeader } from '../src/client/TrajectoryTurnHeader.tsx'
-import { trajectoryRecordId } from '../src/client/trajectory-record.ts'
 import {
   appendTrajectoryPartialLayout as appendTrajectoryPartialLayoutWithLocale,
-  advertisedToolCallCounts,
   deriveTrajectoryLayout as deriveTrajectoryLayoutWithLocale,
 } from '../src/client/layout.ts'
 import { t, tZh } from './locale.client.ts'
@@ -28,8 +26,7 @@ const appendTrajectoryPartialLayout = (
   turns: Parameters<typeof appendTrajectoryPartialLayoutWithLocale>[0],
   partial: Parameters<typeof appendTrajectoryPartialLayoutWithLocale>[1],
   lastIndex: number,
-  advertisedCallCounts?: Parameters<typeof appendTrajectoryPartialLayoutWithLocale>[4],
-) => appendTrajectoryPartialLayoutWithLocale(turns, partial, lastIndex, t, advertisedCallCounts)
+) => appendTrajectoryPartialLayoutWithLocale(turns, partial, lastIndex, t)
 
 interface LegacyConversationSlice {
   readonly nodes: readonly ConversationNode[]
@@ -141,82 +138,6 @@ describe('deriveTrajectoryLayout', () => {
     expect(tool?.timeSeconds).toBe(1.3)
   })
 
-  it('pairs each occurrence of a repeated advertised id with its own result', () => {
-    const nodes = [
-      {
-        kind: 'assistant', seq: 2, time: 6_000, turn: 1, step: 1,
-        blocks: [
-          { kind: 'tool-call', callId: 'dup', name: 'bash', argsRaw: '{"command":"ls"}' },
-          { kind: 'tool-call', callId: 'dup', name: 'grep', argsRaw: '{"pattern":"x"}' },
-        ],
-      },
-      {
-        kind: 'tool-result', seq: 3, time: 7_000, callId: 'dup',
-        name: 'bash', args: PartialArguments.fromText('{"command":"ls"}'),
-        call: { name: 'bash', argsRaw: '{"command":"ls"}' }, callTime: 6_100,
-        content: [{ type: 'text', text: 'a.txt' }], isError: false,
-      },
-      {
-        kind: 'tool-result', seq: 4, time: 8_000, callId: 'dup',
-        name: 'grep', args: PartialArguments.fromText('{"pattern":"x"}'),
-        call: { name: 'grep', argsRaw: '{"pattern":"x"}' }, callTime: 6_200,
-        content: [{ type: 'text', text: 'match' }], isError: false,
-      },
-    ] as LegacyConversationSlice['nodes']
-    const cells = deriveTrajectoryLayout({ nodes, partial: null, runningCalls: [] })
-      .flatMap(turn => turn.groups.flatMap(group => group.cells))
-    const tools = cells.filter(cell => cell.kind === 'tool')
-    expect(tools.map(cell => cell.toolName)).toEqual(['bash', 'grep'])
-    expect(tools.map(cell => cell.resultPreviewMarkdown)).toEqual(['a.txt', 'match'])
-    expect(tools.map(cell => cell.startedAt)).toEqual([6_100, 6_200])
-    expect(tools.map(cell => trajectoryRecordId(cell))).toEqual([
-      'tool\u0000call\u0000dup',
-      'tool\u0000call\u0000dup\u00001',
-    ])
-  })
-
-  it('keeps a single-occurrence tool record identity unchanged', () => {
-    const nodes = [
-      {
-        kind: 'assistant', seq: 2, time: 6_000, turn: 1, step: 1,
-        blocks: [{ kind: 'tool-call', callId: 'c1', name: 'bash', argsRaw: '{"command":"ls"}' }],
-      },
-      {
-        kind: 'tool-result', seq: 3, time: 7_000, callId: 'c1',
-        name: 'bash', args: PartialArguments.fromText('{"command":"ls"}'),
-        call: { name: 'bash', argsRaw: '{"command":"ls"}' }, callTime: 6_100,
-        content: [{ type: 'text', text: 'a.txt' }], isError: false,
-      },
-    ] as LegacyConversationSlice['nodes']
-    const cells = deriveTrajectoryLayout({ nodes, partial: null, runningCalls: [] })
-      .flatMap(turn => turn.groups.flatMap(group => group.cells))
-    expect(trajectoryRecordId(cells.find(cell => cell.kind === 'tool')!))
-      .toBe('tool\u0000call\u0000c1')
-  })
-
-  it('renders an orphan result of a repeated id as its own record', () => {
-    const nodes = [
-      {
-        kind: 'tool-result', seq: 3, time: 7_000, callId: 'dup',
-        name: 'bash', args: PartialArguments.fromText('{"command":"ls"}'),
-        call: { name: 'bash', argsRaw: '{"command":"ls"}' }, callTime: 6_100,
-        content: [{ type: 'text', text: 'first' }], isError: false, subCalls: [],
-      },
-      {
-        kind: 'tool-result', seq: 4, time: 8_000, callId: 'dup',
-        name: 'grep', args: PartialArguments.fromText('{"pattern":"x"}'),
-        call: { name: 'grep', argsRaw: '{"pattern":"x"}' }, callTime: 6_200,
-        content: [{ type: 'text', text: 'second' }], isError: false, subCalls: [],
-      },
-    ] as LegacyConversationSlice['nodes']
-    const cells = deriveTrajectoryLayout({ nodes, partial: null, runningCalls: [] })
-      .flatMap(turn => turn.groups.flatMap(group => group.cells))
-    expect(cells.map(cell => trajectoryRecordId(cell))).toEqual([
-      'tool\u0000call\u0000dup',
-      'tool\u0000call\u0000dup\u00001',
-    ])
-  })
-
   it('adds runningCalls not already present and leaves their time blank', () => {
     const turns = deriveTrajectoryLayout({
       nodes: [],
@@ -296,37 +217,6 @@ describe('deriveTrajectoryLayout', () => {
 
     expect(cells.map(cell => cell.kind)).toEqual(['message', 'tool'])
     expect(cells.filter(cell => cell.callId === 'c1')).toHaveLength(1)
-  })
-
-  it('continues the occurrence numbering of a repeated id into the streamed partial', () => {
-    const nodes = [{
-      kind: 'assistant', seq: 2, time: 2_000, turn: 1, step: 1,
-      blocks: [
-        { kind: 'tool-call', callId: 'dup', name: 'bash', argsRaw: '{"command":"ls"}' },
-        { kind: 'tool-call', callId: 'dup', name: 'grep', argsRaw: '{"pattern":"x"}' },
-      ],
-    }] as unknown as LegacyConversationSlice['nodes']
-    const partial = {
-      turn: 1,
-      step: 2,
-      blocks: [{ kind: 'tool-call' as const, callId: 'dup', name: 'sed', argsRaw: '{"file":"a"}' }],
-    }
-    const counts = advertisedToolCallCounts(nodes, partial)
-    const base = deriveTrajectoryLayout({
-      nodes,
-      partial: { ...partial, blocks: [] },
-      runningCalls: [],
-    })
-    const streamed = appendTrajectoryPartialLayout(base, partial, 3, counts)
-    const tools = streamed.flatMap(turn => turn.groups.flatMap(group => group.cells))
-      .filter(cell => cell.kind === 'tool')
-
-    expect(tools.map(cell => cell.text)).toEqual(['bash', 'grep', 'sed'])
-    expect(tools.map(cell => trajectoryRecordId(cell))).toEqual([
-      'tool\u0000call\u0000dup',
-      'tool\u0000call\u0000dup\u00001',
-      'tool\u0000call\u0000dup\u00002',
-    ])
   })
 
   it('omits duration when node times are missing instead of rendering NaN', () => {

@@ -232,7 +232,8 @@ describe('released v1 whole-artifact relationships', () => {
       .toThrow(/advertised tool call/)
     expect(() => decode([...turnAndStep, { ...started, seq: 2, time: 3 }])).toThrow(/advertised tool call/)
     expect(() => decode([...turnAndStep, result(2)])).toThrow(/no advertised tool lifecycle/)
-    expect(() => decode([...turnAndStep, {
+    // Two blocks carrying the same id in one assistant message are two occurrences.
+    const duplicatedAdvertised = {
       ...advertised,
       data: {
         ...advertised.data,
@@ -244,7 +245,11 @@ describe('released v1 whole-artifact relationships', () => {
           ],
         },
       },
-    }])).toThrow(/repeats advertised tool call/)
+    }
+    expect(decode([...turnAndStep, duplicatedAdvertised]).events).toHaveLength(3)
+    expect(() => decode([...turnAndStep, duplicatedAdvertised, started, result(4), {
+      type: 'step/end', seq: 5, time: 6, data: { turn: 1, step: 1 },
+    }])).toThrow(/unresolved tool call/)
     expect(() => decode([...turnAndStep, advertised, started, result(4, 'b')])).toThrow(/tool-result block|tool lifecycle/)
     expect(() => decode([...turnAndStep, advertised, {
       type: 'step/end', seq: 3, time: 4, data: { turn: 1, step: 1 },
@@ -281,8 +286,7 @@ describe('released v1 whole-artifact relationships', () => {
     }])).toThrow(/TOOL_NOT_STARTED repair/)
   })
 
-  it('admits duplicate advertised tool calls under allowDuplicateAdvertisedToolCall', () => {
-    const flag = { allowDuplicateAdvertisedToolCall: true } as const
+  it('admits a tool-call id advertised more than once and resolves each occurrence in stream order', () => {
     const turnAndStep: SessionFormatEvent[] = [
       { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
       { type: 'step/start', seq: 1, time: 2, data: { turn: 1, step: 1 } },
@@ -321,28 +325,32 @@ describe('released v1 whole-artifact relationships', () => {
 
     // Two occurrences: each needs its own tool/call and tool/result, resolved in stream order.
     expect(() => assertReleasedArtifactRelationships(
-      artifact([...turnAndStep, ad(2), tc(3), tr(4), ad(5), tc(6), tr(7)]), flag,
+      artifact([...turnAndStep, ad(2), tc(3), tr(4), ad(5), tc(6), tr(7)]),
     )).not.toThrow()
 
     // Three occurrences.
     expect(() => assertReleasedArtifactRelationships(
       artifact([
         ...turnAndStep, ad(2), tc(3), tr(4), ad(5), tc(6), tr(7), ad(8), tc(9), tr(10),
-      ]), flag,
+      ]),
     )).not.toThrow()
 
-    // Without the flag, a second advertisement of the same id while one is still open is rejected.
+    // Each admitted occurrence still needs its own lifecycle: one call and one result leave the
+    // second advertisement unresolved at the step boundary.
     expect(() => assertReleasedArtifactRelationships(
-      artifact([...turnAndStep, ad(2), ad(3)]), {},
-    )).toThrow(/repeats advertised tool call/)
+      artifact([
+        ...turnAndStep, ad(2), tc(3), tr(4), ad(5),
+        { type: 'step/end', seq: 6, time: 7, data: { turn: 1, step: 1 } },
+      ]),
+    )).toThrow(/leaves unresolved tool call/)
 
-    // Mismatched arguments on the second occurrence under the flag.
+    // Mismatched arguments on the second occurrence.
     const mismatched: SessionFormatEvent = {
       type: 'tool/call', seq: 6, time: 7,
       data: { turn: 1, step: 1, callId: 'a', name: 'read', arguments: '{"x":1}' },
     }
     expect(() => assertReleasedArtifactRelationships(
-      artifact([...turnAndStep, ad(2), tc(3), tr(4), ad(5), mismatched]), flag,
+      artifact([...turnAndStep, ad(2), tc(3), tr(4), ad(5), mismatched]),
     )).toThrow(/does not match one advertised tool call/)
 
     // A result for an id with no advertised lifecycle at all.
@@ -358,7 +366,7 @@ describe('released v1 whole-artifact relationships', () => {
       },
     }
     expect(() => assertReleasedArtifactRelationships(
-      artifact([...turnAndStep, dangling]), flag,
+      artifact([...turnAndStep, dangling]),
     )).toThrow(/no advertised tool lifecycle/)
   })
 

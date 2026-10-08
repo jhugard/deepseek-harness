@@ -30,12 +30,15 @@ export const sessionFormatCatalogOptions: SessionFormatCatalogOptions = {
     sessionFormatV3ToV4,
   ],
   restoreCurrent(artifact) {
-    const restored = restoreReleasedV4Artifact(artifact, KNOWN_SESSION_EVENT_TYPES)
+    // Released v4 logs written before the adapter disambiguated repeated tool-call ids are
+    // restored here, so each advertised occurrence is admitted and matched in stream order.
+    // `assertReleasedV4Relationships` retains the strict refusal for callers that ask for it.
+    const restored = restoreReleasedV4Artifact(artifact, KNOWN_SESSION_EVENT_TYPES, 'recoverable')
     validateInstalledCurrentSessionArtifact(restored)
     return restored
   },
   restoreTransformedCurrent(artifact) {
-    return restoreReleasedV4Artifact(artifact, KNOWN_SESSION_EVENT_TYPES)
+    return restoreReleasedV4Artifact(artifact, KNOWN_SESSION_EVENT_TYPES, 'recoverable')
   },
   restoreCurrentHeader(header) {
     assertReleasedV4Header(header)

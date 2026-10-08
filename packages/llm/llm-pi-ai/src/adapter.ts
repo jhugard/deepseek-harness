@@ -101,6 +101,11 @@ export interface PiAiAdapterOptions {
    * conversion because its stored replay state is unusable by this build.
    */
   onReplayDegrade?: (detail: { provider: string; model: string; reason: string }) => void
+  /**
+   * Observe one tool-call id the provider issued more than once in one assistant turn, which the
+   * adapter gives a distinct harness identity so each call stays separately addressable.
+   */
+  onDuplicateToolCallId?: (detail: { provider: string; model: string; id: string; occurrence: number }) => void
 }
 
 /** The two auth injectables a pi-ai collection is built with. */
@@ -387,7 +392,9 @@ export class PiAiAdapter extends LlmAdapter {
         // Harness-owned and therefore win collisions.
         headers: requestHeaders(profile.headers),
       })
-      const iterator = toStreamChunks(events, model.contextWindow, options.signal, model.id)[Symbol.asyncIterator]()
+      const iterator = toStreamChunks(events, model.contextWindow, options.signal, model.id, (detail) => {
+        this.config.onDuplicateToolCallId?.({ provider: options.provider, model: options.model, ...detail })
+      })[Symbol.asyncIterator]()
       let exhausted = false
       try {
         while (true) {
