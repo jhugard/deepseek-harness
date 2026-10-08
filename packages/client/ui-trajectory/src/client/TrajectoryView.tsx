@@ -17,8 +17,8 @@ import type { WatchToolResult } from './watch-tool-result.ts'
 import { TrajectoryToolbar } from './TrajectoryToolbar.tsx'
 import { TrajectoryTimeline } from './TrajectoryTimeline.tsx'
 import {
-  appendTrajectoryPartialLayout, deriveTrajectoryLayout,
-  type TrajectoryTurnModel,
+  appendTrajectoryPartialLayout, advertisedToolCallCounts, deriveTrajectoryLayout,
+  parseOccurrenceKey, type TrajectoryTurnModel,
 } from './layout.ts'
 import {
   trajectoryTimelineFocusIndexes,
@@ -198,7 +198,9 @@ export function TrajectoryView({
   const runningCalls = inspection.runningCalls
   const requests = inspection.requests
   const callSchemas = inspection.callSchemas
-  const inspectCallId = viewRequest?.view === 'trajectory' ? viewRequest.focus : null
+  const inspectFocus = viewRequest?.view === 'trajectory' ? parseOccurrenceKey(viewRequest.focus) : null
+  const inspectCallId = inspectFocus?.callId ?? null
+  const inspectOccurrence = inspectFocus?.occurrence ?? 0
   const inspectNodeIndex = useMemo(() => inspectCallId === null
     ? -1
     : completeInspection.eventNodes.findIndex(node => node.kind === 'assistant'
@@ -332,6 +334,15 @@ export function TrajectoryView({
     nodes, eventLocations, partialTurn, partialStep,
     runningCalls, requests, inspection.systemPrompts, callSchemas, t,
   ])
+  const advertisedCallCounts = useMemo(
+    () => advertisedToolCallCounts(
+      nodes,
+      partialTurn === null || partialStep === null
+        ? null
+        : { turn: partialTurn, step: partialStep, blocks: [] },
+    ),
+    [nodes, partialStep, partialTurn],
+  )
   const timelinePartialSignature = partialStructureSignature(partial)
   const partialStartTime = partial?.timing?.stepStartTime
   const partialFirstTokenTime = partial?.timing?.firstTokenTime
@@ -345,15 +356,15 @@ export function TrajectoryView({
     },
   [partialStep, partialTurn, timelinePartialSignature, partialStartTime, partialFirstTokenTime])
   const timelineTurns = useMemo(
-    () => appendTrajectoryPartialLayout(finalized.turns, timelinePartial, finalized.lastIndex, t),
-    [finalized, timelinePartial, t],
+    () => appendTrajectoryPartialLayout(finalized.turns, timelinePartial, finalized.lastIndex, t, advertisedCallCounts),
+    [advertisedCallCounts, finalized, timelinePartial, t],
   )
   const timelineMode: TrajectoryTimelineMode = actualDuration
     ? actualTime ? 'actual' : 'duration'
     : actualTime ? 'time' : 'sequence'
   const partialSearchTurns = useMemo(
-    () => appendTrajectoryPartialLayout([], partial, finalized.lastIndex, t),
-    [finalized.lastIndex, partial, t],
+    () => appendTrajectoryPartialLayout([], partial, finalized.lastIndex, t, advertisedCallCounts),
+    [advertisedCallCounts, finalized.lastIndex, partial, t],
   )
   const searchLayouts = useMemo(
     () => [finalized.turns, partialSearchTurns] as const,
@@ -609,6 +620,7 @@ export function TrajectoryView({
           collapsedTools={collapsedTools}
           onToggleTool={toggleTool}
           inspectCallId={inspectCallId}
+          inspectOccurrence={inspectOccurrence}
           onInspectApplied={completeViewRequest}
         />
       </div>

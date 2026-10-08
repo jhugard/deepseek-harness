@@ -240,7 +240,7 @@ export interface ChatNodeOwnerProps {
   groupPart?: string
   cwd?: string | undefined
   openFile: (path: string, options?: OpenFileOptions) => void
-  inspectCall: ((callId: ToolCallId) => void) | undefined
+  inspectCall: ((callId: ToolCallId, occurrence: number) => void) | undefined
   forkAt: (seq: number) => void
   /** Session-authorized image loader supplied by the Chat view. */
   loadImage: MessageImageLoader

@@ -46,6 +46,8 @@ Alpha 迁移边会拒绝冻结清单之外的所有事件类型，包括带有 `
 
 有限的历史规范化会把 `steering/message` 转换为 `user/message`、把 `compact/*` 事件重命名为 `compaction/*`、移除 `turn/start.trigger`、转换已停用的 `turn/end` reason、添加当前消息包装层，并为旧消息、retry chain 与压缩（compaction）组补充确定性 id，同时移除已停用且重复的 `request/header.header.messagePrefix`。已停用的 `request/header-delta`、`mode/set` 和 `request/header` fallback reason 会使迁移失败。除此之外，任何事件、引用、来源或 payload 事实都不得改变。
 
+Released-relationship 校验通过 [relationships.ts](src/relationships.ts) 中的 `ReleasedRelationshipExtensions` 按后续代际角色逐项启用。`allowDuplicateAdvertisedToolCall` 接纳一个 step 内被声明多次的 id，这正是本地 OpenAI 兼容服务器为并行工具调用产生的形态；每个 occurrence 仍需要自己的 `tool/call` 与 `tool/result`，按流顺序配对。裸 v1 restore 不传入该扩展，保持严格。
+
 -----
 
 <a id="understand-the-implementation"></a>

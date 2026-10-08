@@ -351,6 +351,106 @@ describe.each(causes)('openTurnClosers (cause %o)', (cause) => {
     expect(result.data.message.content[0].text).toContain('first verify external state or ask the user')
   })
 
+  it('closes every occurrence of an id an advertised twice in one step', () => {
+    // Local OpenAI-compatible servers re-emit one tool call under the same
+    // composed id within a step, so the same id can name distinct calls. Each
+    // occurrence needs its own result: one closer leaves the step unresolved
+    // and the v4 reader rejects its step/end.
+    const events: SessionEvent[] = [
+      userTurnStart(1, 0),
+      { type: 'step/start', seq: 1, time: 1, data: { turn: 1, step: 1 } },
+      { type: 'assistant/message', seq: 2, time: 2, surfaceOp: 'append', data: {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [
+            { type: 'tool-call', id: ToolCallId('call-a'), name: 'pwsh', arguments: '{"command":"git diff"}' },
+            { type: 'tool-call', id: ToolCallId('call-dup'), name: 'pwsh', arguments: '{"command":"git diff"}' },
+            { type: 'tool-call', id: ToolCallId('call-dup'), name: 'grep', arguments: '{"pattern":"Console"}' },
+          ],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      } },
+      { type: 'tool/call', seq: 3, time: 3, data: { turn: 1, step: 1, callId: ToolCallId('call-a'), name: 'pwsh', arguments: '{"command":"git diff"}' } },
+    ]
+    const closers = openTurnClosers(events, cause)
+    expect(closers.map(e => e.type)).toEqual(['tool/result', 'tool/result', 'tool/result', 'step/end', 'turn/end'])
+    expect(closers.slice(0, 3).map(e => e.type === 'tool/result' && ({
+      callId: e.data.message.toolCallId,
+      code: e.data.error?.code,
+      sourceEventSeqs: (e as SurfaceEvent).sourceEventSeqs,
+    }))).toEqual([
+      { callId: 'call-a', code: TOOL_OUTCOME_UNKNOWN, sourceEventSeqs: [3] },
+      { callId: 'call-dup', code: TOOL_NOT_STARTED, sourceEventSeqs: undefined },
+      { callId: 'call-dup', code: TOOL_NOT_STARTED, sourceEventSeqs: undefined },
+    ])
+    // Distinct message ids: the seq suffix keeps each synthetic result unique.
+    const ids = closers.slice(0, 3).map(e => e.type === 'tool/result' && e.data.message.id)
+    expect(new Set(ids).size).toBe(3)
+  })
+
+  it('closes a started and an unstarted occurrence of the same id with their own codes', () => {
+    const events: SessionEvent[] = [
+      userTurnStart(1, 0),
+      { type: 'step/start', seq: 1, time: 1, data: { turn: 1, step: 1 } },
+      { type: 'assistant/message', seq: 2, time: 2, surfaceOp: 'append', data: {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [
+            { type: 'tool-call', id: ToolCallId('call-dup'), name: 'grep', arguments: '{"pattern":"a"}' },
+            { type: 'tool-call', id: ToolCallId('call-dup'), name: 'grep', arguments: '{"pattern":"b"}' },
+          ],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      } },
+      { type: 'tool/call', seq: 3, time: 3, data: { turn: 1, step: 1, callId: ToolCallId('call-dup'), name: 'grep', arguments: '{"pattern":"a"}' } },
+    ]
+    const closers = openTurnClosers(events, cause)
+    expect(closers.map(e => e.type)).toEqual(['tool/result', 'tool/result', 'step/end', 'turn/end'])
+    expect(closers.slice(0, 2).map(e => e.type === 'tool/result' && e.data.error?.code))
+      .toEqual([TOOL_OUTCOME_UNKNOWN, TOOL_NOT_STARTED])
+  })
+
+  it('closes only the remaining occurrence when a result answers one of two', () => {
+    const events: SessionEvent[] = [
+      userTurnStart(1, 0),
+      { type: 'step/start', seq: 1, time: 1, data: { turn: 1, step: 1 } },
+      { type: 'assistant/message', seq: 2, time: 2, surfaceOp: 'append', data: {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [
+            { type: 'tool-call', id: ToolCallId('call-dup'), name: 'grep', arguments: '{"pattern":"a"}' },
+            { type: 'tool-call', id: ToolCallId('call-dup'), name: 'grep', arguments: '{"pattern":"b"}' },
+          ],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      } },
+      { type: 'tool/call', seq: 3, time: 3, data: { turn: 1, step: 1, callId: ToolCallId('call-dup'), name: 'grep', arguments: '{"pattern":"a"}' } },
+      { type: 'tool/result', seq: 4, time: 4, surfaceOp: 'append', data: {
+        turn: 1, step: 1,
+        message: createToolResultMessage({
+          callId: ToolCallId('call-dup'),
+          content: [{ type: 'text', text: 'first answer' }],
+          isError: false,
+        }),
+      } },
+    ]
+    const closers = openTurnClosers(events, cause)
+    expect(closers.map(e => e.type)).toEqual(['tool/result', 'step/end', 'turn/end'])
+    expect(closers[0]!.type === 'tool/result' && closers[0]!.data.error?.code).toBe(TOOL_NOT_STARTED)
+  })
+
   it('handles tool/call without a matching assistant/message entry gracefully', () => {
     // A raw tool/call with no assistant-registered pending call has nothing to
     // answer; repair still closes the step and turn without synthesizing a result.

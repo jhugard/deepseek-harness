@@ -98,12 +98,27 @@ export function openTurnClosers(events: readonly SessionEvent[], cause: OpenTurn
 }
 
 /**
+ * One advertised tool-call occurrence. A repeated id names distinct calls: local
+ * OpenAI-compatible servers re-emit one tool call under the same composed id
+ * within a step (see pi-ai `openai-completions` `normalizeToolCallId` for the
+ * composition), and the V4 reader admits each occurrence separately.
+ */
+interface PendingCall {
+  readonly turn: number
+  readonly step: number
+  callSeq?: SessionSeqType
+}
+
+/**
  * Track unanswered assistant tool requests from one Session's committed events.
  * Observe from the start of the owned step or replay prefix, and recover before
- * its step closes. This state retains pending identities, not event history.
+ * its step closes. This state retains pending occurrences, not event history:
+ * each id maps to its occurrences in advertisement order, and `tool/call` and
+ * `tool/result` consume the first matching occurrence, so a repeated id yields
+ * one synthetic result per occurrence rather than one per id.
  */
 export class ToolCallRecovery {
-  private readonly pendingCalls = new Map<ToolCallId, { turn: number; step: number; callSeq?: SessionSeqType }>()
+  private readonly pendingCalls = new Map<ToolCallId, PendingCall[]>()
   private last: Pick<SessionEvent, 'seq' | 'time'> | undefined
 
   /** @param cause - defaults to interrupted live/crash recovery; fork-seed construction supplies its own cause. */
@@ -124,22 +139,31 @@ export class ToolCallRecovery {
       case 'assistant/message':
         for (const block of event.data.message.content) {
           if (block.type === 'tool-call') {
-            this.pendingCalls.set(block.id, { turn: event.data.turn, step: event.data.step })
+            const occurrence: PendingCall = { turn: event.data.turn, step: event.data.step }
+            const existing = this.pendingCalls.get(block.id)
+            if (existing === undefined) this.pendingCalls.set(block.id, [occurrence])
+            else existing.push(occurrence)
           }
         }
         break
       case 'tool/call': {
-        const entry = this.pendingCalls.get(event.data.callId)
+        const entry = this.pendingCalls.get(event.data.callId)?.find(candidate => candidate.callSeq === undefined)
         if (entry) entry.callSeq = event.seq
         break
       }
       case 'tool/result': {
         const callId = event.data.message.source.callId
-        const entry = this.pendingCalls.get(callId)
-        if (event.surfaceOp === 'append' && entry !== undefined
-          && entry.turn === event.data.turn && entry.step === event.data.step) {
-          this.pendingCalls.delete(callId)
-        }
+        const occurrences = this.pendingCalls.get(callId)
+        if (event.surfaceOp !== 'append' || occurrences === undefined) break
+        const inPlace = occurrences.filter(candidate =>
+          candidate.turn === event.data.turn && candidate.step === event.data.step)
+        // A result answers the occurrence whose start it follows; an unstarted
+        // occurrence is answered only when no started one remains.
+        const answered = inPlace.find(candidate => candidate.callSeq !== undefined) ?? inPlace[0]
+        if (answered === undefined) break
+        const remaining = occurrences.filter(candidate => candidate !== answered)
+        if (remaining.length === 0) this.pendingCalls.delete(callId)
+        else this.pendingCalls.set(callId, remaining)
         break
       }
       // SessionEvent is merge-extensible; unrelated events retain pending requests.
@@ -149,10 +173,11 @@ export class ToolCallRecovery {
   }
 
   /**
-   * Build conservative error results in assistant order without changing tracked state.
-   * Sequences follow the latest observed event and timestamps reuse its time.
-   * Callers commit the results and observe those commits before recovering again.
-   * @returns pending tool-result events, empty when no request remains unanswered.
+   * Build conservative error results in assistant order without changing tracked
+   * state. Sequences follow the latest observed event and timestamps reuse its
+   * time. Callers commit the results and observe those commits before recovering
+   * again.
+   * @returns pending tool-result events, one per unanswered occurrence, empty when no request remains unanswered.
    */
   results(): SessionEvent<'tool/result'>[] {
     if (this.last === undefined) return []
@@ -163,34 +188,36 @@ export class ToolCallRecovery {
     const text = CLOSER_TEXT[this.cause.kind]
     // Close calls before their step: providers reject dangling assistant calls,
     // and Map insertion order preserves their transcript order.
-    for (const [callId, { turn, step, callSeq }] of this.pendingCalls) {
-      const started = callSeq !== undefined
-      const message: ToolResultMessage = deepFreeze({
-        id: brandString<MessageId>(`${this.cause.kind}-tool-result-${callId}-${seq}`),
-        role: 'tool',
-        toolCallId: callId,
-        isError: true,
-        source: { kind: 'tool', callId },
-        content: [{
-          type: 'text',
-          text: started ? text.started : text.notStarted,
-        }],
-      })
-      results.push({
-        type: 'tool/result',
-        seq: SessionSeq(seq++),
-        time,
-        data: {
-          turn,
-          step,
-          message,
-          error: started
-            ? { name: 'ToolOutcomeUnknownError', code: TOOL_OUTCOME_UNKNOWN }
-            : { name: 'ToolNotStartedError', code: TOOL_NOT_STARTED },
-        },
-        surfaceOp: 'append',
-        ...started ? { sourceEventSeqs: [callSeq] } : {},
-      })
+    for (const [callId, occurrences] of this.pendingCalls) {
+      for (const { turn, step, callSeq } of occurrences) {
+        const started = callSeq !== undefined
+        const message: ToolResultMessage = deepFreeze({
+          id: brandString<MessageId>(`${this.cause.kind}-tool-result-${callId}-${seq}`),
+          role: 'tool',
+          toolCallId: callId,
+          isError: true,
+          source: { kind: 'tool', callId },
+          content: [{
+            type: 'text',
+            text: started ? text.started : text.notStarted,
+          }],
+        })
+        results.push({
+          type: 'tool/result',
+          seq: SessionSeq(seq++),
+          time,
+          data: {
+            turn,
+            step,
+            message,
+            error: started
+              ? { name: 'ToolOutcomeUnknownError', code: TOOL_OUTCOME_UNKNOWN }
+              : { name: 'ToolNotStartedError', code: TOOL_NOT_STARTED },
+          },
+          surfaceOp: 'append',
+          ...started ? { sourceEventSeqs: [callSeq] } : {},
+        })
+      }
     }
 
     return results

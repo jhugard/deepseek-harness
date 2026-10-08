@@ -32,7 +32,7 @@ Failed to load history: stored session "session-<id>" is corrupt: session "sessi
 
 把广告 id 当作**出现（occurrence）键**而非唯一身份，并让三个表面的修复同步推进——只放宽其中一部分，其余部分仍会失败。
 
-**会话层（提交 `e78c8822e4`，"fix(session): admit duplicate advertised tool-call ids"）。** 三个格式游走器把广告工具调用生命周期按 id 跟踪为**出现列表**，`tool/call` / `tool/result` 引用按流顺序解析：
+**会话层。** 三个格式游走器把广告工具调用生命周期按 id 跟踪为**出现列表**，`tool/call` / `tool/result` 引用按流顺序解析：
 
 1. `assistant/message` 在重复时追加一个出现，而不是抛错。
 2. `tool/call` 匹配最早仍处 `advertised` 状态的出现（如前比较 `name` + `arguments`）并标记为已开始；`tool/result` 消费最早的 `started` 出现——流顺序 FIFO，即数据路径本就依赖的同一配对。
@@ -40,9 +40,9 @@ Failed to load history: stored session "session-<id>" is corrupt: session "sessi
 
 接纳方式沿用已发布日志例外的既有形态：`session-format-v0-to-v1` 中新的 `allowDuplicateAdvertisedToolCall` 扩展（裸 v1 保持严格）、在 `session-format-v1-to-v2` 中作为 `RELEASED_V2_RELATIONSHIP_EXTENSIONS` 的一部分为已发布 v2 硬性启用、以及在没有扩展机制的 v3→v4 游走器中无条件接纳。这就是让受影响会话重新可读、可迁移的东西。
 
-**客户端层（提交 `4de770ef18`，"fix(client): render duplicate advertised tool-call ids as separate occurrences"）。** assembler 按基础键跟踪一个有序的出现列表（`OccurrenceRef { key, started, settled }`）；第 0 次出现保留裸基础键，因此单出现 id 与之前逐字节相同。私有的 `resolveOccurrence` 把每个被接受的 Match 路由到一次出现——对 **start** Match 它重新确认仍被瞬态活动开始锚定的那一个（一次调用的逐块 delta 共享同一锚点，其持久开始重新并入其中），仅当没有仍在等待 start 的未关闭出现时才开新一次；对 **update** Match 它先挂到第一个已开始且未结算的出现，再到第一个仍打开的出现，最后新开一个，从而**结果与其调用按流顺序配对**。`ConversationNodeDefinition` 上两个新的可选钩子让某个 Definition 在不改变其他 Definition 行为的前提下 opting in：`settle(match)` 把当前出现标记为终结，使之后同 id 的 Match 开新一次；`dedupe(match)` 丢弃已记录事件的再发射（例如一次 prune 流程重新发送 `message.id` 已被应用的 `tool/result`，`compaction-tool-result-pruner/src/index.ts:165-171`）。chat 与 trajectory 工具 Definition 都注册了两者。这就是让同一共享 id 下的 N 个并行调用渲染成 N 张独立卡片的东西。
+**客户端层。** assembler 按基础键跟踪一个有序的出现列表（`OccurrenceRef { key, started, settled }`）；第 0 次出现保留裸基础键，因此单出现 id 与之前逐字节相同。私有的 `resolveOccurrence` 把每个被接受的 Match 路由到一次出现——对 **start** Match 它重新确认仍被瞬态活动开始锚定的那一个（一次调用的逐块 delta 共享同一锚点，其持久开始重新并入其中），仅当没有仍在等待 start 的未关闭出现时才开新一次；对 **update** Match 它先挂到第一个已开始且未结算的出现，再到第一个仍打开的出现，最后新开一个，从而**结果与其调用按流顺序配对**。`ConversationNodeDefinition` 上两个新的可选钩子让某个 Definition 在不改变其他 Definition 行为的前提下 opting in：`settle(match)` 把当前出现标记为终结，使之后同 id 的 Match 开新一次；`dedupe(match)` 丢弃已记录事件的再发射（例如一次 prune 流程重新发送 `message.id` 已被应用的 `tool/result`，`compaction-tool-result-pruner/src/index.ts:165-171`）。chat 与 trajectory 工具 Definition 都注册了两者。这就是让同一共享 id 下的 N 个并行调用渲染成 N 张独立卡片的东西。
 
-**推荐的根因上游修复**（随这些提交一并上报）：在 Responses 适配器的**摄入时**归一化非唯一 id——当某槽位组合出的 `call_id|id` 与同一 assistant 消息中更早的槽位冲突时，铸造一个不同的 id（适配器本就按 `output_index` 为槽位键，消歧信息已经在手，只是从未折进 id）。唯一的 harness id 让游走器的唯一性假设与 UI 的每 id 一 Context 设计都得到满足，且零下游特判，并一次性消除全部三个表面。
+**推荐的根因上游修复**：在 Responses 适配器的**摄入时**归一化非唯一 id——当某槽位组合出的 `call_id|id` 与同一 assistant 消息中更早的槽位冲突时，铸造一个不同的 id（适配器本就按 `output_index` 为槽位键，消歧信息已经在手，只是从未折进 id）。唯一的 harness id 让游走器的唯一性假设与 UI 的每 id 一 Context 设计都得到满足，且零下游特判，并一次性消除全部三个表面。
 
 **在所有三个表面上仍然拒绝**的，是真正的歧义，且存储中从未观察到：出现在*不同* step 的重复 id（或 step N 的调用与 step N+1 的结果）、对不上的数量（N 个广告对更少的 `tool/call` / `tool/result`、未配对的结果、`step/end` 时未解决的调用）、以及空字符串工具调用 id。
 
@@ -66,6 +66,6 @@ Failed to load history: stored session "session-<id>" is corrupt: session "sessi
 
 ## Testing
 
-回放测试装置（`acl-diag-reports/dup-demo.mjs`，转录 `acl-diag-reports/dup-demo-output.txt`）把两个活动存储日志（一个冻结的 v2 与写本报告会话的活动 v4）快照后，用 `4878cdabd8`（dsh-v0.2.0-rc.1）检出自带的构建校验代码、以精确的生产选项（`recovery: 'strict'` / `recovery: 'recoverable'`、`validation: 'transformed'`）回放：两条路径上每行都解码通过，两个表面都恰好拒绝在 `finish()`。以 `validation: 'current'` 的对照运行从 `finish()` 内部抛出同一 `SessionFormatError`。对 22 个会话日志文件（2,936 个 `assistant/message` 事件）的只读扫描测得 36 个受影响事件（1.2%）、45 组各恰好 2 次出现的重复 id、0 个跨 step 或跨 turn 复现的 id、45/45 组共享同一工具 `name`、0 个缺 `tool/result` 的重复执行、0 个空字符串 id，且每个受影响消息都在 `local` / `openai-responses` 上。对活动日志的逐出现审计核对了 211/211 个事件：99 个重复组、85 对干净的 FIFO+settle 配对、14 次被 `dedupe` 钩子正确丢弃的 prune 再发射，没有任何误归属的结果。名称/参数失配在以独立于重复 id 的有意义基率出现（重复 id 块中 13.3% vs 其他 4.2%）——误归属是另一个提供方的模型批处理问题，另行跟踪。
+回放测试装置（`acl-diag-reports/dup-demo.mjs`，转录 `acl-diag-reports/dup-demo-output.txt`）把两个活动存储日志（一个冻结的 v2 与写本报告会话的活动 v4）快照后，用 release `dsh-v0.2.0-rc.1` 检出自带的构建校验代码、以精确的生产选项（`recovery: 'strict'` / `recovery: 'recoverable'`、`validation: 'transformed'`）回放：两条路径上每行都解码通过，两个表面都恰好拒绝在 `finish()`。以 `validation: 'current'` 的对照运行从 `finish()` 内部抛出同一 `SessionFormatError`。对 22 个会话日志文件（2,936 个 `assistant/message` 事件）的只读扫描测得 36 个受影响事件（1.2%）、45 组各恰好 2 次出现的重复 id、0 个跨 step 或跨 turn 复现的 id、45/45 组共享同一工具 `name`、0 个缺 `tool/result` 的重复执行、0 个空字符串 id，且每个受影响消息都在 `local` / `openai-responses` 上。对活动日志的逐出现审计核对了 211/211 个事件：99 个重复组、85 对干净的 FIFO+settle 配对、14 次被 `dedupe` 钩子正确丢弃的 prune 再发射，没有任何误归属的结果。名称/参数失配在以独立于重复 id 的有意义基率出现（重复 id 块中 13.3% vs 其他 4.2%）——误归属是另一个提供方的模型批处理问题，另行跟踪。
 
 格式游走器由 `packages/session/session-format-v0-to-v1/tests/relationships.spec.ts`（扩展门控的接纳；重复开始、参数变化与悬空结果被拒绝）、`packages/session/session-format-v1-to-v2/tests/validation.spec.ts`（已发布 v2 扩展中的硬性启用）与 `packages/session/session-format-v3-to-v4/tests/relationships.spec.ts`（该接缝处的无条件接纳）固定。出现拆分由 `packages/client/ui-conversation/tests/conversation-assembler.client.spec.ts` 固定：C,R,C,R 与 C,C,R,R 把每个结果与其自身调用配对，prune 再发射被丢弃，逐调用 delta 重新确认存活的出现而不是开新一次。

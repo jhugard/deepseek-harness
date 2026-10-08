@@ -6,11 +6,13 @@ import { es, pt } from '../src/client/locales.ts'
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { AttachmentId } from '@deepseek-ai/dsh-attachment'
-import type { JsonValue } from '@deepseek-ai/dsh-util-values'
+import { PartialArguments, type JsonValue } from '@deepseek-ai/dsh-util-values'
 import { useState, type ComponentProps, type ReactNode } from 'react'
 import { SessionId } from '@deepseek-ai/dsh-session/types'
 import { SlotTestRuntime } from '@deepseek-ai/dsh-client-test-runtime'
-import type { MessageImageLoader, MessageImagesOwnerProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type {
+  ConversationNode, MessageImageLoader, MessageImagesOwnerProps,
+} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots'
 import { TrajectoryTable as LocalizedTrajectoryTable } from '../src/client/TrajectoryTable.tsx'
 import { deriveTrajectoryLayout, type TrajectoryTurnModel } from '../src/client/layout.ts'
@@ -1610,6 +1612,66 @@ describe('TrajectoryTable', () => {
 
     expect(screen.getByRole('row', { name: /TOOL/ }).getAttribute('aria-selected')).toBe('false')
     expect(onInspectApplied).not.toHaveBeenCalled()
+  })
+
+  // One assistant turn advertising the same call id twice, with one result per occurrence.
+  const duplicateIdNodes = () => [
+    {
+      kind: 'assistant', seq: 2, time: 6_000, turn: 1, step: 1,
+      blocks: [
+        { kind: 'tool-call', callId: 'dup', name: 'bash', argsRaw: '{"command":"ls"}' },
+        { kind: 'tool-call', callId: 'dup', name: 'grep', argsRaw: '{"pattern":"x"}' },
+      ],
+    },
+    {
+      kind: 'tool-result', seq: 3, time: 7_000, callId: 'dup',
+      name: 'bash', args: PartialArguments.fromText('{"command":"ls"}'),
+      call: { name: 'bash', argsRaw: '{"command":"ls"}' }, callTime: 6_100,
+      content: [{ type: 'text', text: 'a.txt' }], isError: false, subCalls: [],
+    },
+    {
+      kind: 'tool-result', seq: 4, time: 8_000, callId: 'dup',
+      name: 'grep', args: PartialArguments.fromText('{"pattern":"x"}'),
+      call: { name: 'grep', argsRaw: '{"pattern":"x"}' }, callTime: 6_200,
+      content: [{ type: 'text', text: 'match' }], isError: false, subCalls: [],
+    },
+  ] as ConversationNode[]
+
+  it('opens the tool record for the occurrence of the clicked call block', () => {
+    const nodes = duplicateIdNodes()
+    const turns = deriveTrajectoryLayout({ nodes, partial: null, runningCalls: [] }, t)
+    render(<TrajectoryTable turns={turns} {...FOLD_PROPS} />)
+
+    fireEvent.click(screen.getByRole('row', { name: /ASSISTANT/ }))
+    fireEvent.click(screen.getByRole('tab', { name: 'Raw' }))
+    const panel = screen.getByRole('complementary', { name: 'Event details' })
+    const jumps = within(panel).getAllByTitle('Open tool call summary')
+    expect(jumps).toHaveLength(2)
+
+    fireEvent.click(jumps[1]!)
+    const selected = [...document.querySelectorAll('tr[data-selected]')]
+    expect(selected).toHaveLength(1)
+    expect(selected[0]?.getAttribute('aria-label')).toContain('grep')
+  })
+
+  it('an inspect request naming an occurrence opens that record', () => {
+    const nodes = duplicateIdNodes()
+    const turns = deriveTrajectoryLayout({ nodes, partial: null, runningCalls: [] }, t)
+    const onInspectApplied = vi.fn()
+    render(
+      <TrajectoryTable
+        turns={turns}
+        {...FOLD_PROPS}
+        inspectCallId="dup"
+        inspectOccurrence={1}
+        onInspectApplied={onInspectApplied}
+      />,
+    )
+
+    const selected = [...document.querySelectorAll('tr[data-selected]')]
+    expect(selected).toHaveLength(1)
+    expect(selected[0]?.getAttribute('aria-label')).toContain('grep')
+    expect(onInspectApplied).toHaveBeenCalledOnce()
   })
 })
 

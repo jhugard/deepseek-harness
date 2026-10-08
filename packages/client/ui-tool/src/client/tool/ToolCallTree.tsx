@@ -18,10 +18,12 @@ function callName(call: ToolCallPhaseProps): string {
 
 /** One atomic call dispatched through the Tool-owned keyed slot. */
 const ToolCall = memo(function ToolCall({
-  renderSlot, callId, toolName, call, openFile, renderFallback, cwd, home, inspectCall, loadImage, useDisclosure, children,
+  renderSlot, callId, occurrence, toolName, call, openFile, renderFallback, cwd, home, inspectCall, loadImage, useDisclosure, children,
 }: Pick<ToolTreeProps, 'renderSlot' | 'openFile' | 'cwd' | 'inspectCall' | 'loadImage' | 'useDisclosure'> & {
   renderFallback: (owner: ToolCallOwnerProps) => ReactNode
   callId: string
+  /** 0-based occurrence of `callId`; Inspect addresses this row, not the first of the id. */
+  occurrence: number
   toolName: string
   call: ToolCallPhaseProps
   home?: string | undefined
@@ -36,8 +38,8 @@ const ToolCall = memo(function ToolCall({
     home,
     loadImage,
     useDisclosure,
-    inspect: inspectCall === undefined ? undefined : () => { inspectCall(callId) },
-  }), [callId, toolName, call, openFile, cwd, home, loadImage, inspectCall, useDisclosure])
+    inspect: inspectCall === undefined ? undefined : () => { inspectCall(callId, occurrence) },
+  }), [callId, occurrence, toolName, call, openFile, cwd, home, loadImage, inspectCall, useDisclosure])
   const autoReviewDenied = useMemo(
     () => call.phase === 'result' && toolRowModel(toolName, call.block).autoReviewDenial !== null,
     [toolName, call],
@@ -60,10 +62,12 @@ const ToolCall = memo(function ToolCall({
 })
 
 const ToolCallBranch = memo(function ToolCallBranch({
-  renderSlot, block, cwd, home, openFile, renderFallback, inspectCall, loadImage, useDisclosure,
+  renderSlot, block, occurrence, cwd, home, openFile, renderFallback, inspectCall, loadImage, useDisclosure,
 }: Pick<ToolTreeProps, 'renderSlot' | 'cwd' | 'openFile' | 'inspectCall' | 'loadImage' | 'useDisclosure'> & {
   renderFallback: (owner: ToolCallOwnerProps) => ReactNode
   block: ToolCallBlock
+  /** 0-based occurrence of `block.callId` among the calls advertising that id. */
+  occurrence: number
   home?: string | undefined
 }) {
   const call = useMemo(() => toolCallPhase(block), [block])
@@ -71,6 +75,7 @@ const ToolCallBranch = memo(function ToolCallBranch({
     <ToolCall
       renderSlot={renderSlot}
       callId={call.block.callId}
+      occurrence={occurrence}
       toolName={callName(call)}
       call={call}
       openFile={openFile}
@@ -88,6 +93,8 @@ const ToolCallBranch = memo(function ToolCallBranch({
               key={child.callId}
               renderSlot={renderSlot}
               block={child}
+              // PTC sub-call ids are host-minted as `<parent>:ptc:<n>`, so each has one occurrence.
+              occurrence={0}
               cwd={cwd}
               home={home}
               openFile={openFile}
@@ -123,6 +130,7 @@ export function ToolCallTree({
     <ToolCallBranch
       renderSlot={renderSlot}
       block={node.data.root}
+      occurrence={node.data.occurrence}
       cwd={cwd}
       home={home}
       openFile={openFile}

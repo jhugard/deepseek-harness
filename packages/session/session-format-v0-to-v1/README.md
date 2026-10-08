@@ -46,6 +46,8 @@ The alpha edge refuses every event type outside its frozen inventory, including 
 
 The bounded historical normalizers convert `steering/message` to `user/message`, rename `compact/*` events to `compaction/*`, remove `turn/start.trigger`, convert retired `turn/end` reasons, add current message wrappers and deterministic ids for legacy messages, retry chains, and compaction groups, and remove the obsolete `request/header.header.messagePrefix` duplicate. Retired `request/header-delta`, `mode/set`, and the `request/header` fallback reason refuse migration. No other event, reference, source, or payload fact may change.
 
+Released-relationship validation is opt-in per later-generation role through `ReleasedRelationshipExtensions` in [relationships.ts](src/relationships.ts). `allowDuplicateAdvertisedToolCall` admits an id advertised more than once in one step, which local OpenAI-compatible servers produce for parallel tool calls; each occurrence still requires its own `tool/call` and `tool/result`, matched in stream order. A bare v1 restore passes no such extension and stays strict.
+
 -----
 
 <a id="understand-the-implementation"></a>

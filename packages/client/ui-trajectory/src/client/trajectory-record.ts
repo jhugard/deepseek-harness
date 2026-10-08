@@ -34,6 +34,8 @@ export interface TrajectorySourceBlock {
   file?: FileAttachmentRef
   callId?: string
   toolName?: string
+  /** 0-based occurrence of this call id in the ledger, so a repeated id links to its own tool record. */
+  occurrence?: number
 }
 
 /** Data and optional presentation attributes for one trajectory record. */
