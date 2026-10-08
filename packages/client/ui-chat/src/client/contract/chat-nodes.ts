@@ -45,6 +45,12 @@ export type FinalAssistantChatData = AssistantChatData & {
 /** Root Tool row payload; the root lifecycle owns all recursive subcalls. */
 export interface ToolChatData {
   readonly root: ToolCallBlock
+  /**
+   * 0-based occurrence of `root.callId` among the tool calls advertising that
+   * id. A provider that re-issues one id for parallel calls yields one row per
+   * occurrence, and Inspect addresses the clicked row rather than the first.
+   */
+  readonly occurrence: number
 }
 
 /** One manual command and its correlated compaction transaction. */

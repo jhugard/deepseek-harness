@@ -236,7 +236,7 @@ System image 接纳要求非空 attachment id、PNG／JPEG／WebP／GIF MIME 类
 | 所有者 | 必需关系 |
 |---|---|
 | `turn/start`、`turn/end`、`step/start`、`step/end` | Turn／step 编号有序，开放所有者匹配，turn／step 不重叠，结束边界不遗留已声明或已开始但未解决的工具调用。未完成尾部保持开放。 |
-| `assistant/message`、`tool/call`、追加的 `tool/result` | 匹配开放 step；声明的调用 id 唯一，开始保留 name／arguments，结果结算一个已声明调用。开始之前的结果必须是精确获准的 `TOOL_NOT_STARTED` 修复。工具结果的表面替换要求开放 turn，不重放原始调用生命周期。 |
+| `assistant/message`、`tool/call`、追加的 `tool/result` | 匹配开放 step。每个 `tool-call` 内容块为其已声明 id 开启一个 occurrence，因此同一 id 被声明两次就需要每个 occurrence 各有一个 `tool/call` 与一个 `tool/result`，按流顺序配对：`tool/call` 匹配最早的未开始 occurrence，结果匹配最早的已开始 occurrence，没有已开始时匹配最早的未开始 occurrence。开始保留 name／arguments。开始之前的结果必须是精确获准的 `TOOL_NOT_STARTED` 修复。工具结果的表面替换要求开放 turn，不重放原始调用生命周期。 |
 | `system/message`、`developer/message`、`assistant/attempt` | 匹配开放 turn 与 step。Request header 和 context 要求开放 turn。 |
 | `tool/ptc-dispatch-start`、`tool/ptc-dispatch` | 要求开放 turn、唯一 sub-call 开始与结算、稳定的 root／parent／name／arguments，以及属于同一 root 的嵌套 parent。 |
 | `llm/retry`、`llm/retry-started` | 匹配当前请求 provider 和 turn／step，每条策略链的尝试连续、retry 身份稳定，每次 start 匹配一个先前已调度的尝试。 |

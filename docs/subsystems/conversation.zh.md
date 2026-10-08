@@ -25,7 +25,7 @@ Chat 与 Trajectory 可以识别同一个持久 event family，但各自保留�
 
 每个 Session 都保留单调增长的 active target 集合。创建或读取 target source 不会激活它。shell 会显式激活持久化选择或新选择的 View，其他消费者则通过 target source 的首个订阅激活 target。首次激活会创建该 target 的 builder，并从当前按 target 索引的 Context 调用一次 `replace()`。后续 flush 对每个 active target 调用 `apply()`，取消订阅不会移除 target。
 
-shell 拥有 View 选择，并在 binding 创建、被选为 current 或 View roster 变化时，于渲染前解析已注册的偏好 View 或 Chat fallback。assembler 只接收解析后的 target id，不自行选择 Chat 或其他默认 target。第三方 View 使用相同的选择与激活操作。View Definition 可以提供 `toolCallFocus(callId)`；shell 仅为声明了此能力且可见的目标提供 Inspect，由目标将调用 id 映射为自己的焦点标识。
+shell 拥有 View 选择，并在 binding 创建、被选为 current 或 View roster 变化时，于渲染前解析已注册的偏好 View 或 Chat fallback。assembler 只接收解析后的 target id，不自行选择 Chat 或其他默认 target。第三方 View 使用相同的选择与激活操作。View Definition 可以提供 `toolCallFocus(callId, occurrence)`；shell 仅为声明了此能力且可见的目标提供 Inspect，由目标将调用 id 及其 0 基 occurrence 映射为自己的焦点标识。
 
 <a id="group-definitions"></a>
 ## Group Definition
@@ -244,6 +244,8 @@ export function apply(ctx: ClientContext): void {
 ```
 
 `match(event)` 是身份提取器，不是 fold：它只能收到当前 `SessionEventLike`，并返回 Definition 内部 id 与生命周期角色。命中后，Assembler 通过 `(kind, id)` 定位 Context；当前最早的 start 初始化 State，不论它是持久事件还是瞬态事件。后续所有 Match，包括其他 start，都调用 `update`。移除瞬态 Match 后，从剩余事件重新选择 start 并重算 State；没有剩余 start 时 State 为 undefined。两个函数都必须返回引擎随后采用的 State；推荐返回新的 immutable value，但函数原地修改后返回同一对象时，采用语义也相同。
+
+同一个业务 id 可以重复出现——提供方为并行调用重复发出同一个工具调用 id 时，一个 step 内会多次声明该 id。此时 Assembler 为每个 `(kind, id)` 维护有序 occurrence 列表，并把每个 Match 路由到其中一个 occurrence，因此每次重复都有自己的 Context 与 `ConversationNodeContext.occurrence`。occurrence 0 保留裸 Context key。start Match 优先重新接回仍由瞬态 live start 锚定的 occurrence，之后才开启新的；update Match 依次匹配第一个已开始未结算的 occurrence、第一个仍开放的 occurrence，最后开启新的。两个可选 Definition hook 为 id 重复的 Definition 控制该路由：`settle(match)` 声明该 Match 对其更新的 occurrence 是终结性的，后续同 id Match 因此开启新的 occurrence；`dedupe(match)` 返回按 occurrence 计算的身份，用于丢弃已应用事件的重复投递。两者默认无效果，id 不重复的 Definition 不受影响。
 
 `ConversationNodeDefinitionInput` 接受上述函数，或事件类型到匹配函数的只读表。函数形式的注册接收所有事件；表形式只接收列出的类型。Registry 在注册关系变化时复制表条目并预计算有序候选 Set，不在逐事件分发时构造候选集合。替换表时先注销，再重新注册。两种形式解析后的 `ConversationNodeDefinition` 都保留可调用的 `match(event)`。
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { Session, SessionId, SessionLogOffset, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
+import { Session, SessionId, SessionLogOffset, interruptedTurnClosers, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
 import { sessionFormatCatalog } from '@deepseek-ai/dsh-session-format-catalog'
 import type { SessionFormatEvent } from '@deepseek-ai/dsh-session-format'
 
@@ -23,7 +23,7 @@ const toolCall = () => row('tool/call', { ...step, callId: 'call', name: 'read',
 const request = () => row('request/header', { reason: 'initial', header: { config: { provider: 'mock', model: 'mock' } } })
 
 /** Exercise physical JSON, catalog relationship admission, Session adoption, and derivation together. */
-function reopen(rows: readonly Row[], inherited = 0, seeded = false) {
+function reopen(rows: readonly (Row | SessionEvent)[], inherited = 0, seeded = false) {
   const restore = sessionFormatCatalog.createRestore({ type: 'session', version: 4, id: 'native-relations', createdAt: 1, delegationDepth: 0, isSeeded: seeded, ...(seeded ? { parentSession: 'parent' } : {}) }, { recovery: 'strict', validation: 'current' })
   for (const [seq, candidate] of rows.entries()) {
     const event = { ...candidate, seq, time: seq + 1 } as unknown as SessionFormatEvent
@@ -62,6 +62,22 @@ describe('mandatory V4 lifecycle restoration', () => {
     const resolved = [...begin(), assistant([call, call]), toolCall(), result(), toolCall(), result(), ...end()]
     expect(reopen(resolved).messages.map(message => message.role)).toEqual(['assistant', 'tool', 'tool'])
     for (let length = 0; length < resolved.length; length += 1) expect(() => reopen(resolved.slice(0, length))).not.toThrow()
+  })
+
+  it('admits the crash-repair closers for a step that advertised one id twice', () => {
+    // The same composed id names two distinct calls, and the interruption left
+    // the second unstarted. `interruptedTurnClosers` must supply one result per
+    // remaining occurrence, or this reader rejects the `step/end` it appends.
+    const second = { type: 'tool-call', id: 'call', name: 'grep', arguments: '{"pattern":"a"}' }
+    const openTail = [...begin(), assistant([call, second]), toolCall()]
+    expect(() => reopen([...openTail, row('step/end', step), row('turn/end', { turn: 1, reason: { kind: 'interrupted' } })]))
+      .toThrow('step/end leaves unresolved tool call')
+
+    const closers = interruptedTurnClosers(
+      openTail.map((candidate, seq) => ({ ...candidate, seq, time: seq + 1 }) as unknown as SessionEvent),
+    )
+    expect(closers.map(event => event.type)).toEqual(['tool/result', 'tool/result', 'step/end', 'turn/end'])
+    expect(() => reopen([...openTail, ...closers])).not.toThrow()
   })
 
   it.each([

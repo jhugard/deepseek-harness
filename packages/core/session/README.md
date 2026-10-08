@@ -108,7 +108,7 @@ Every append uses the shared iterative `snapshotJsonValue()` pass, which reads, 
 
 ### Shared recovery
 
-`ToolCallRecovery` tracks unanswered requests from committed events without retaining event history. AgentLoop observes live steps; crash recovery and fork-seed construction replay their prefixes through `openTurnClosers`. Live failures and crash recovery use interrupted-result wording by default; fork construction passes the fork cause to select its distinct retry guidance. The caller appends recovery results before closing the step ([reference](../agent-loop/README.md)).
+`ToolCallRecovery` tracks unanswered requests from committed events without retaining event history, holding one pending entry per advertised occurrence of an id rather than one per id, so a step advertising the same id twice closes each occurrence with its own result. AgentLoop observes live steps; crash recovery and fork-seed construction replay their prefixes through `openTurnClosers`. Live failures and crash recovery use interrupted-result wording by default; fork construction passes the fork cause to select its distinct retry guidance. The caller appends recovery results before closing the step ([reference](../agent-loop/README.md)).
 
 ### Derived history
 

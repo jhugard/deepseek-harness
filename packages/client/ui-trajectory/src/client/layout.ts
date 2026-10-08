@@ -18,7 +18,7 @@ import type {
   TrajectorySourceBlock,
 } from './trajectory-record.ts'
 import type { TrajectorySnapshot } from './trajectory-contract.ts'
-import { formatElapsedSeconds } from './trajectory-record.ts'
+import { formatElapsedSeconds, trajectoryRecordId } from './trajectory-record.ts'
 import type { TrajectoryTranslate } from './locales.ts'
 import { COMPACTION_INTERRUPTED_ERROR } from './copy-codes.ts'
 
@@ -44,6 +44,12 @@ export interface TrajectoryLayoutInput {
   runningCalls: TrajectorySnapshot['runningCalls']
   requests?: readonly RequestView[]
   callSchemas?: RequestInspectionSnapshot['callSchemas']
+  /**
+   * Advertised tool-call occurrence counts already laid by a finalized layout.
+   * A streamed partial passes them so its cells continue the same numbering
+   * instead of reopening occurrence 0 of an id an earlier step already used.
+   */
+  advertisedCallCounts?: ReadonlyMap<string, number>
 }
 
 interface UsageLike {
@@ -60,6 +66,8 @@ interface LaidCell {
   absTime: number | null
   toolName?: string
   callId?: string
+  /** Occurrence-suffixed join key when this cell owns one tool-call occurrence. */
+  occurrenceKey?: string
   subCalls?: readonly ToolCallBlock[]
 }
 
@@ -79,6 +87,76 @@ type InputNode = Extract<
   TrajectorySnapshot['eventNodes'][number],
   { kind: 'user' | 'steering' | 'context' }
 >
+
+/**
+ * Per-pass counters that pair each occurrence of a repeated tool-call id with
+ * its own result, start time, and record identity.
+ */
+interface OccurrencePairing {
+  /** @param callId - advertised tool-call id. @returns 0-based occurrence index among advertised blocks. */
+  block(callId: string): number
+  /** @param callId - tool-result call id. @returns 0-based occurrence index among result records. */
+  result(callId: string): number
+  /** @param callId - sub-dispatch call id. @returns 0-based occurrence index among sub-dispatch records. */
+  sub(callId: string): number
+}
+
+function createOccurrencePairing(
+  initialAdvertisedCounts?: ReadonlyMap<string, number>,
+): OccurrencePairing {
+  const blocks = new Map<string, number>(initialAdvertisedCounts)
+  const results = new Map<string, number>()
+  const subs = new Map<string, number>()
+  const next = (counts: Map<string, number>, callId: string): number => {
+    const occurrence = counts.get(callId) ?? 0
+    counts.set(callId, occurrence + 1)
+    return occurrence
+  }
+  return {
+    block: callId => next(blocks, callId),
+    result: callId => next(results, callId),
+    sub: callId => next(subs, callId),
+  }
+}
+
+/**
+ * Join key distinguishing one occurrence of a repeated tool-call id.
+ * @param callId - advertised tool-call id.
+ * @param occurrence - 0-based occurrence of that id; 0 keeps the bare id.
+ * @returns the occurrence key.
+ */
+export function occurrenceKey(callId: string, occurrence: number): string {
+  return occurrence === 0 ? callId : `${callId}\u0000${occurrence}`
+}
+
+/**
+ * Read the tool-call id and occurrence encoded by `occurrenceKey`. A key with
+ * no occurrence suffix is occurrence 0, so a single-occurrence id round-trips
+ * unchanged.
+ * @param key - occurrence key produced by `occurrenceKey`.
+ * @returns the call id and its 0-based occurrence.
+ */
+export function parseOccurrenceKey(key: string): { callId: string; occurrence: number } {
+  const at = key.lastIndexOf('\u0000')
+  if (at === -1) return { callId: key, occurrence: 0 }
+  const occurrence = Number(key.slice(at + 1))
+  return Number.isSafeInteger(occurrence) && occurrence > 0
+    ? { callId: key.slice(0, at), occurrence }
+    : { callId: key, occurrence: 0 }
+}
+
+/**
+ * Record identity for one tool record occurrence. Occurrence 0 keeps the
+ * id-only identity `trajectoryRecordId` already resolves for such a cell, so a
+ * single-occurrence session is unchanged; later occurrences stay distinct.
+ * @param kind - record kind owning the call.
+ * @param callId - tool call id shared by the occurrences.
+ * @param occurrence - 0-based occurrence of that id in stream order.
+ * @returns identity equal to the fallback identity for occurrence 0.
+ */
+function toolRecordId(kind: 'tool' | 'subtool', callId: string, occurrence: number): string {
+  return `${kind}\u0000call\u0000${callId}${occurrence === 0 ? '' : `\u0000${occurrence}`}`
+}
 
 type OrderedLayoutEntry =
   | {
@@ -180,20 +258,26 @@ export function deriveTrajectoryLayout(
   const {
     nodes, eventLocations, partial, runningCalls, requests = [], callSchemas,
   } = input
+  const pairing = createOccurrencePairing(input.advertisedCallCounts)
   const resultByCall = indexResults(nodes)
-  const callById = new Map<string, ToolCallBlock>(resultByCall)
-  for (const call of runningCalls) callById.set(call.callId, call)
-  const emittedCallIds = indexAssistantCallIds(nodes)
+  const callById = new Map<string, ToolCallBlock[]>()
+  for (const [callId, results] of resultByCall) callById.set(callId, [...results])
+  for (const call of runningCalls) {
+    callById.set(call.callId, [...(callById.get(call.callId) ?? []), call])
+  }
+  const advertisedCalls = advertisedToolCallCounts(nodes, null)
   const followingAssistants = indexFollowingAssistants(nodes)
-  const callStartById = new Map<string, number>()
-  for (const result of resultByCall.values()) {
-    const startedAt = finiteTime(result.callTime)
-    if (startedAt !== null) callStartById.set(result.callId, startedAt)
+  const callStartById = new Map<string, number[]>()
+  for (const results of resultByCall.values()) {
+    for (const result of results) {
+      const startedAt = finiteTime(result.callTime)
+      if (startedAt !== null) callStartById.set(result.callId, [...(callStartById.get(result.callId) ?? []), startedAt])
+    }
   }
   for (const call of runningCalls) {
     if (call.phase === 'preparing') continue
     const startedAt = finiteTime(call.time)
-    if (startedAt !== null) callStartById.set(call.callId, startedAt)
+    if (startedAt !== null) callStartById.set(call.callId, [...(callStartById.get(call.callId) ?? []), startedAt])
   }
   const turns = new Map<number, TurnBucket>()
   const standaloneCompactions: TurnBucket[] = []
@@ -438,7 +522,8 @@ export function deriveTrajectoryLayout(
     }
     if (node.kind === 'assistant') {
       const laidList = withSubCalls(
-        expandAssistant(node, index + 1, prevAbsTime, resultByCall, callStartById, callById, t),
+        expandAssistant(node, index + 1, prevAbsTime, resultByCall, callStartById, callById, pairing, t),
+        pairing,
         t,
       )
       if (node.step > 0) pushStep(node.turn, node.step, laidList)
@@ -469,17 +554,20 @@ export function deriveTrajectoryLayout(
       continue
     }
     if (node.kind === 'tool-result') {
-      if (!emittedCallIds.has(node.callId)) {
+      const occurrence = pairing.result(node.callId)
+      if (occurrence >= (advertisedCalls.get(node.callId) ?? 0)) {
         const toolName = node.call?.name
         const resultPreview = summarizeResult(node, t)
         const laidList: LaidCell[] = [{
           absTime: finiteTime(node.callTime ?? node.time),
           ...(toolName !== undefined ? { toolName } : {}),
           callId: node.callId,
+          occurrenceKey: occurrenceKey(node.callId, occurrence),
           subCalls: node.subCalls,
           cell: {
             index: ++index,
             kind: 'tool',
+            recordId: toolRecordId('tool', node.callId, occurrence),
             sourceSeq: node.seq,
             ...(node.call !== null
               ? summarizeCall(node.call.name, node.call.argsRaw)
@@ -494,7 +582,7 @@ export function deriveTrajectoryLayout(
             startedAt: finiteTime(node.callTime),
           },
         }]
-        for (const laid of expandSubCalls(node.subCalls, index, t)) {
+        for (const laid of expandSubCalls(node.subCalls, index, pairing, t)) {
           laidList.push(laid)
           index = laid.cell.index
         }
@@ -516,9 +604,10 @@ export function deriveTrajectoryLayout(
       resultByCall,
       callStartById,
       callById,
+      pairing,
       t,
       { streaming: true },
-    ), t)
+    ), pairing, t)
     if (partial.step > 0) pushStep(partial.turn, partial.step, laidList)
     else for (const laid of laidList) pushMessage(partial.turn, laid)
     const last = laidList[laidList.length - 1]
@@ -526,16 +615,26 @@ export function deriveTrajectoryLayout(
   }
 
   const seenCalls = collectCallIds(turns)
+  const runningCounts = new Map<string, number>()
   for (const call of runningCalls) {
-    if (call.phase === 'preparing' || seenCalls.has(call.callId)) continue
+    const occurrence = runningCounts.get(call.callId) ?? 0
+    runningCounts.set(call.callId, occurrence + 1)
+    if (call.phase === 'preparing') continue
+    // A durable advertisement already laid this call's row; only the running
+    // calls beyond the advertised occurrences are new records.
+    if (occurrence < (advertisedCalls.get(call.callId) ?? 0)) continue
+    const key = occurrenceKey(call.callId, occurrence)
+    if (seenCalls.has(key)) continue
     const laidList: LaidCell[] = [{
       absTime: null,
       toolName: call.name,
       callId: call.callId,
+      occurrenceKey: key,
       subCalls: call.subCalls,
       cell: {
         index: ++index,
         kind: 'tool',
+        recordId: toolRecordId('tool', call.callId, occurrence),
         ...summarizeCall(call.name, call.argsRaw),
         inputDetail: call.argsRaw,
         callId: call.callId,
@@ -543,7 +642,7 @@ export function deriveTrajectoryLayout(
         startedAt: finiteTime(call.time),
       },
     }]
-    for (const laid of expandSubCalls(call.subCalls, index, t)) {
+    for (const laid of expandSubCalls(call.subCalls, index, pairing, t)) {
       laidList.push(laid)
       index = laid.cell.index
     }
@@ -579,6 +678,9 @@ export function deriveTrajectoryLayout(
  * @param partial - Current in-flight assistant projection.
  * @param lastIndex - Highest cell index in the finalized layout.
  * @param t - Trajectory locale translator.
+ * @param advertisedCallCounts - occurrences per tool-call id the finalized layout
+ *   already consumed, excluding the partial's own step. Omitted when the layout
+ *   being extended has no durable advertisements.
  * @returns The original layout without a partial, otherwise a layout sharing every unaffected turn.
  */
 export function appendTrajectoryPartialLayout(
@@ -586,12 +688,14 @@ export function appendTrajectoryPartialLayout(
   partial: TrajectorySnapshot['partial'],
   lastIndex: number,
   t: TrajectoryTranslate,
+  advertisedCallCounts?: ReadonlyMap<string, number>,
 ): readonly TrajectoryTurnModel[] {
   if (partial === null) return turns
   const partialTurn = deriveTrajectoryLayout({
     nodes: [],
     partial,
     runningCalls: [],
+    ...(advertisedCallCounts === undefined ? {} : { advertisedCallCounts }),
   }, t).at(0)
   if (partialTurn === undefined) return turns
   const streamed: TrajectoryTurnModel = {
@@ -616,15 +720,15 @@ export function appendTrajectoryPartialLayout(
     const group = groups[groupIndex]
     /* v8 ignore next -- findIndex proved the dense array position exists. */
     if (group === undefined) continue
-    const streamedCallIds = new Set(
-      streamedGroup.cells.flatMap(cell => cell.callId === undefined ? [] : [cell.callId]),
+    const streamedKeys = new Set(
+      streamedGroup.cells.map(cell => trajectoryRecordId(cell)),
     )
     groups[groupIndex] = {
       ...streamedGroup,
       cells: [
         ...group.cells.filter(cell =>
           cell.requestOnly !== true
-          && (cell.callId === undefined || !streamedCallIds.has(cell.callId)),
+          && (cell.callId === undefined || !streamedKeys.has(trajectoryRecordId(cell))),
         ),
         ...streamedGroup.cells,
       ],
@@ -727,9 +831,10 @@ function expandAssistant(
   node: AssistantMessageNode,
   startIndex: number,
   prevAbsTime: number | null,
-  results: Map<string, ToolResultNode>,
-  callStarts: ReadonlyMap<string, number>,
-  calls: ReadonlyMap<string, ToolCallBlock>,
+  results: ReadonlyMap<string, ToolResultNode[]>,
+  callStarts: ReadonlyMap<string, number[]>,
+  calls: ReadonlyMap<string, ToolCallBlock[]>,
+  pairing: OccurrencePairing,
   t: TrajectoryTranslate,
   opts?: { streaming?: boolean },
 ): LaidCell[] {
@@ -751,6 +856,13 @@ function expandAssistant(
     .filter(block => block.kind === 'reasoning' && (!streaming || block.text !== ''))
     .map(block => block.kind === 'reasoning' ? block.text : '')
     .join('\n\n')
+  // Occurrences are counted once per assistant node, in block order, so the
+  // message's source blocks and the tool records below agree on which
+  // occurrence each advertised call is.
+  const callOccurrence = new Map<number, number>()
+  node.blocks.forEach((block, position) => {
+    if (block.kind === 'tool-call') callOccurrence.set(position, pairing.block(block.callId))
+  })
   const message: TrajectoryCellProps = {
     index: ++index,
     recordId: `assistant\u0000${node.turn}\u0000${node.step}`,
@@ -766,7 +878,8 @@ function expandAssistant(
         : {}),
     ...(messageText !== '' ? { outputDetail: messageText } : {}),
     ...(thinkingText !== '' ? { thinkingDetail: thinkingText } : {}),
-    sourceBlocks: node.blocks.map(block => assistantSourceBlock(block)),
+    sourceBlocks: node.blocks.map((block, position) =>
+      assistantSourceBlock(block, callOccurrence.get(position) ?? 0)),
     timeSeconds: messageDuration,
     startedAt: recordedStart,
   }
@@ -781,23 +894,26 @@ function expandAssistant(
   }
   out.push({ absTime: nodeAbs, cell: message })
 
-  for (const block of node.blocks) {
+  node.blocks.forEach((block, position) => {
     // Text and reasoning belong to the one Assistant record emitted above.
-    if (block.kind !== 'tool-call') continue
-    const result = results.get(block.callId)
+    if (block.kind !== 'tool-call') return
+    const occurrence = callOccurrence.get(position) ?? 0
+    const result = results.get(block.callId)?.[occurrence]
     const toolDuration = streaming || result === undefined
       ? null
       : durationSeconds(result.time, result.callTime)
-    const callAbs = finiteTime(callStarts.get(block.callId))
-    const call = calls.get(block.callId)
+    const callAbs = finiteTime(callStarts.get(block.callId)?.[occurrence])
+    const call = calls.get(block.callId)?.[occurrence]
     const resultPreview = result === undefined ? undefined : summarizeResult(result, t)
     out.push({
       absTime: callAbs,
       toolName: block.name,
       callId: block.callId,
+      occurrenceKey: occurrenceKey(block.callId, occurrence),
       ...(call === undefined ? {} : { subCalls: call.subCalls }),
       cell: {
         index: ++index, kind: 'tool',
+        recordId: toolRecordId('tool', block.callId, occurrence),
         ...summarizeCall(block.name, block.argsRaw),
         inputDetail: block.argsRaw,
         callId: block.callId,
@@ -813,7 +929,7 @@ function expandAssistant(
         startedAt: callAbs,
       },
     })
-  }
+  })
   return out
 }
 
@@ -841,7 +957,7 @@ function promptChangeLabel(change: RequestPromptChange, t: TrajectoryTranslate):
   return t('layout.systemPromptAndToolsUpdated')
 }
 
-function assistantSourceBlock(block: AssistantBlock): TrajectorySourceBlock {
+function assistantSourceBlock(block: AssistantBlock, occurrence: number): TrajectorySourceBlock {
   switch (block.kind) {
     case 'text': return { type: 'text', content: block.text }
     case 'reasoning': return { type: 'thinking', content: block.text }
@@ -850,6 +966,7 @@ function assistantSourceBlock(block: AssistantBlock): TrajectorySourceBlock {
       content: block.argsRaw,
       callId: block.callId,
       toolName: block.name,
+      occurrence,
     }
     case 'image': return sourceBlock({ type: 'image', attachment: block.attachment })
     case 'other': return sourceBlock(block.block)
@@ -984,49 +1101,63 @@ function attachUsage(cell: TrajectoryCellProps, usage: UsageLike | undefined): v
   if (usage.reasoningTokens !== undefined) cell.think = usage.reasoningTokens
 }
 
-function indexResults(nodes: TrajectorySnapshot['eventNodes']): Map<string, ToolResultNode> {
-  const map = new Map<string, ToolResultNode>()
+function indexResults(nodes: TrajectorySnapshot['eventNodes']): Map<string, ToolResultNode[]> {
+  const map = new Map<string, ToolResultNode[]>()
   for (const node of nodes) {
-    if (node.kind === 'tool-result') map.set(node.callId, node)
+    if (node.kind !== 'tool-result') continue
+    map.set(node.callId, [...(map.get(node.callId) ?? []), node])
   }
   return map
 }
 
-function indexAssistantCallIds(nodes: TrajectorySnapshot['eventNodes']): ReadonlySet<string> {
-  const ids = new Set<string>()
+/**
+ * Count how many times each tool-call id is advertised by durable assistant
+ * messages outside the step the in-flight partial is streaming. A streamed
+ * partial consumes these counts first, so it reopens the occurrence a later
+ * step advertised while still matching the record the same step already laid.
+ * @param nodes - loaded conversation nodes.
+ * @param partial - in-flight assistant whose own step is excluded, or null to
+ *   count every durable advertisement.
+ * @returns advertised occurrence count per tool-call id.
+ */
+export function advertisedToolCallCounts(
+  nodes: TrajectorySnapshot['eventNodes'],
+  partial: TrajectorySnapshot['partial'] | null,
+): ReadonlyMap<string, number> {
+  const counts = new Map<string, number>()
   for (const node of nodes) {
     if (node.kind !== 'assistant') continue
+    if (partial !== null && node.turn === partial.turn && node.step === partial.step) continue
     for (const block of node.blocks) {
-      if (block.kind === 'tool-call') ids.add(block.callId)
+      if (block.kind !== 'tool-call') continue
+      counts.set(block.callId, (counts.get(block.callId) ?? 0) + 1)
     }
   }
-  return ids
+  return counts
 }
 
 function collectCallIds(
   turns: Map<number, TurnBucket>,
 ): Set<string> {
-  const ids = new Set<string>()
+  const keys = new Set<string>()
   for (const entry of turns.values()) {
     for (const group of entry.groups) {
       for (const laid of group.laid) {
-        if (laid.callId !== undefined) ids.add(laid.callId)
+        if (laid.occurrenceKey !== undefined) keys.add(laid.occurrenceKey)
       }
     }
   }
-  return ids
+  return keys
 }
 
-
-
 /** Interleave each tool cell's nested child calls right after it, reindexing followers. */
-function withSubCalls(laidList: LaidCell[], t: TrajectoryTranslate): LaidCell[] {
+function withSubCalls(laidList: LaidCell[], pairing: OccurrencePairing, t: TrajectoryTranslate): LaidCell[] {
   if (!laidList.some(laid => laid.subCalls !== undefined && laid.subCalls.length > 0)) return laidList
   const out: LaidCell[] = []
   let index = laidList[0] !== undefined ? laidList[0].cell.index - 1 : 0
   for (const laid of laidList) {
     out.push({ ...laid, cell: { ...laid.cell, index: ++index } })
-    for (const sub of expandSubCalls(laid.subCalls, index, t)) {
+    for (const sub of expandSubCalls(laid.subCalls, index, pairing, t)) {
       out.push(sub)
       index = sub.cell.index
     }
@@ -1038,6 +1169,7 @@ function withSubCalls(laidList: LaidCell[], t: TrajectoryTranslate): LaidCell[] 
 function expandSubCalls(
   subs: readonly ToolCallBlock[] | undefined,
   startIndex: number,
+  pairing: OccurrencePairing,
   t: TrajectoryTranslate,
 ): LaidCell[] {
   if (subs === undefined || subs.length === 0) return []
@@ -1046,14 +1178,17 @@ function expandSubCalls(
   for (const sub of subs) {
     if (!('kind' in sub) && sub.phase === 'preparing') continue
     const settled = 'kind' in sub
+    const occurrence = pairing.sub(sub.callId)
     const resultPreview = settled ? summarizeResult(sub, t) : undefined
     const laid: LaidCell = {
       absTime: settled ? finiteTime(sub.callTime ?? sub.time) : finiteTime(sub.time),
       toolName: settled ? sub.call?.name ?? sub.callId : sub.name,
       callId: sub.callId,
+      occurrenceKey: occurrenceKey(sub.callId, occurrence),
       cell: {
         index: ++index,
         kind: 'subtool',
+        recordId: toolRecordId('subtool', sub.callId, occurrence),
         callId: sub.callId,
         ...(settled
           ? (sub.call !== null
@@ -1080,7 +1215,7 @@ function expandSubCalls(
       },
     }
     out.push(laid)
-    for (const child of expandSubCalls(sub.subCalls, index, t)) {
+    for (const child of expandSubCalls(sub.subCalls, index, pairing, t)) {
       out.push(child)
       index = child.cell.index
     }

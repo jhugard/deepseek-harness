@@ -2065,4 +2065,27 @@ describe('ConversationNodeAssembler', () => {
       'start@3+r5',
     ])
   })
+
+  it('publishes each occurrence index on the Context it hands the Definition', () => {
+    const assembler = new ConversationNodeAssembler(
+      new TestEventDefinitions([{
+        ...duplicatedToolDefinition({
+          settle: match => match.event.type === 'tool/result',
+          dedupe: match => match.event.type === 'tool/result' ? String(match.event.data.message.id) : null,
+        }),
+        buildViewNode: context => node(context, `${context.id}#${context.occurrence}`),
+      }]),
+      new TestViewDefinitions([testView()]),
+    )
+    assembler.replaceWindow([
+      duplicatedCall(1), duplicatedCall(2), duplicatedCall(3),
+      duplicatedResult(4, 'r1'), duplicatedResult(5, 'r2'), duplicatedResult(6, 'r3'),
+    ], false)
+    assembler.flush()
+    const snapshot = testSnapshot(assembler)
+    expect(snapshot?.order).toEqual(['4:tooldup', '4:tooldup#1', '4:tooldup#2'])
+    expect([...(snapshot?.nodes.values() ?? [])].map(value => value.data)).toEqual([
+      'dup#0', 'dup#1', 'dup#2',
+    ])
+  })
 })

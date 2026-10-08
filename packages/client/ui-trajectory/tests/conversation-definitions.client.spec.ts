@@ -173,7 +173,8 @@ function systemMessage(text: string) {
 
 describe('Trajectory conversation Definitions', () => {
   it('addresses tool-call inspection with the persisted call identity', () => {
-    expect(trajectoryViewDefinition.toolCallFocus?.('call-1')).toBe('call-1')
+    expect(trajectoryViewDefinition.toolCallFocus?.('call-1', 0)).toBe('call-1')
+    expect(trajectoryViewDefinition.toolCallFocus?.('call-1', 2)).toBe('call-1\u00002')
   })
 
   it('preserves developer tool-change content', () => {

@@ -36,6 +36,7 @@ interface Dependency {
  */
 interface OccurrenceRef {
   readonly key: string
+  readonly occurrence: number
   started: boolean
   settled: boolean
 }
@@ -44,6 +45,7 @@ interface InternalContext {
   readonly key: string
   readonly kind: string
   readonly id: string
+  readonly occurrence: number
   readonly definition: ConversationNodeDefinition
   startSeq: number | undefined
   start: ConversationStartMatch | undefined
@@ -58,6 +60,7 @@ interface InternalContext {
 interface PendingMatch {
   readonly definition: ConversationNodeDefinition
   readonly id: string
+  readonly occurrence: number
   readonly match: ConversationMatch
 }
 
@@ -116,6 +119,7 @@ function contextSnapshot<State>(context: InternalContext): ConversationNodeConte
     key: context.key,
     kind: context.kind,
     id: context.id,
+    occurrence: context.occurrence,
     matches: context.matches,
     start: context.start,
     state: context.state as State | undefined,
@@ -494,14 +498,14 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
    * still-open occurrence, and only then open a new one — so results pair
    * with their calls in stream order.
    *
-   * @returns the resolved occurrence key, or null when the Match is dropped
-   * by the Definition's `dedupe` hook (re-emission of an already-seen identity).
+   * @returns the resolved occurrence, or null when the Match is dropped by the
+   * Definition's `dedupe` hook (re-emission of an already-seen identity).
    */
   private resolveOccurrence(
     definition: ConversationNodeDefinition,
     id: string,
     match: ConversationMatch,
-  ): string | null {
+  ): OccurrenceRef | null {
     const baseKey = conversationContextKey(definition.kind, id)
     const role = match.role
     const dedupe = definition.dedupe
@@ -514,17 +518,17 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
         this.dedupeSeen.set(baseKey, seen)
       }
     }
-    let refs = this.occurrences.get(baseKey)
+    const refs = this.occurrences.get(baseKey)
     if (refs === undefined) {
-      refs = [{ key: baseKey, started: role === 'start', settled: false }]
-      this.occurrences.set(baseKey, refs)
-      return baseKey
+      const first = { key: baseKey, occurrence: 0, started: role === 'start', settled: false }
+      this.occurrences.set(baseKey, [first])
+      return first
     }
     if (role === 'start') {
       const unstarted = refs.find(ref => !ref.started)
       if (unstarted !== undefined) {
         unstarted.started = true
-        return unstarted.key
+        return unstarted
       }
       // A start re-affirms the first open occurrence still anchored by a
       // transient live start, scanning in order so each parallel call's start
@@ -544,24 +548,34 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
           if (candidate.role === 'start') lastStartMatch = candidate
         }
         if (lastStartMatch !== undefined && lastStartMatch.event.type === 'assistant/live-chunk') {
-          return ref.key
+          return ref
         }
       }
-      const fresh = { key: `${baseKey}#${refs.length}`, started: true, settled: false }
+      const fresh = {
+        key: `${baseKey}#${refs.length}`,
+        occurrence: refs.length,
+        started: true,
+        settled: false,
+      }
       refs.push(fresh)
-      return fresh.key
+      return fresh
     }
     const openUnsettled = refs.find(ref => ref.started && !ref.settled)
     if (openUnsettled !== undefined) {
       const settle = definition.settle
       if (settle !== undefined && settle(match) === true) openUnsettled.settled = true
-      return openUnsettled.key
+      return openUnsettled
     }
     const open = refs.find(ref => !ref.started)
-    if (open !== undefined) return open.key
-    const fresh = { key: `${baseKey}#${refs.length}`, started: false, settled: false }
+    if (open !== undefined) return open
+    const fresh = {
+      key: `${baseKey}#${refs.length}`,
+      occurrence: refs.length,
+      started: false,
+      settled: false,
+    }
     refs.push(fresh)
-    return fresh.key
+    return fresh
   }
 
   private matchInput(input: SessionEventLikeEntry): ConversationPublication {
@@ -574,11 +588,11 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
     pending: Map<string, PendingMatch[]>,
   ): ConversationPublication {
     return this.dispatchInput(input, (definition, id, match) => {
-      const key = this.resolveOccurrence(definition, id, match)
-      if (key === null) return 'none'
-      const matches = pending.get(key) ?? []
-      matches.push({ definition, id, match })
-      pending.set(key, matches)
+      const ref = this.resolveOccurrence(definition, id, match)
+      if (ref === null) return 'none'
+      const matches = pending.get(ref.key) ?? []
+      matches.push({ definition, id, occurrence: ref.occurrence, match })
+      pending.set(ref.key, matches)
       return definition.publication?.(match) ?? 'immediate'
     })
   }
@@ -649,11 +663,13 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
     definition: ConversationNodeDefinition,
     id: string,
     key: string,
+    occurrence: number,
   ): InternalContext {
     const context: InternalContext = {
       key,
       kind: definition.kind,
       id,
+      occurrence,
       definition,
       startSeq: undefined,
       start: undefined,
@@ -674,10 +690,11 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
     id: string,
     match: ConversationMatch,
   ): ConversationPublication {
-    const key = this.resolveOccurrence(definition, id, match)
-    if (key === null) return 'none'
+    const ref = this.resolveOccurrence(definition, id, match)
+    if (ref === null) return 'none'
+    const key = ref.key
     let context = this.contexts.get(key)
-    context ??= this.createContext(definition, id, key)
+    context ??= this.createContext(definition, id, key, ref.occurrence)
     const starting = match.role === 'start' && context.start === undefined
     const previous = context.matches.at(-1)
     if (previous !== undefined && previous.event.seq >= match.event.seq) {
@@ -719,7 +736,7 @@ export class ConversationNodeAssembler implements ConversationViewSnapshotStore 
       const first = entries[0]
       if (first === undefined) continue
       let context = this.contexts.get(key)
-      context ??= this.createContext(first.definition, first.id, key)
+      context ??= this.createContext(first.definition, first.id, key, first.occurrence)
       const additions = entries
         .map((entry) => {
           if (entry.definition !== context.definition || entry.id !== context.id) {

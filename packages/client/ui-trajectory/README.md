@@ -55,7 +55,7 @@ The view is a pure projection: Trajectory-owned Definitions assemble business re
 
 Native and nested PTC Tool results retain their raw structured error details. Failed records show the error code in the ledger and the error name and code in the inspector.
 
-Tool records begin at durable tool/call events and retain complete argument text with a lazy `args` view, reused by paired results. Chat's transient preparing stage does not create Trajectory tool rows or alter historical tool timing.
+Tool records begin at durable tool/call events and retain complete argument text with a lazy `args` view, reused by paired results. Chat's transient preparing stage does not create Trajectory tool rows or alter historical tool timing. A tool-call id advertised more than once in one step yields one tool row per occurrence, and the Nth row pairs with the Nth result of that id in stream order; each row keeps its own identity, start time, result, and duration. A message Block jump and a Chat Inspect both address the occurrence they were clicked on rather than always the first.
 
 A complete appended prompt without a loaded request header appears as a standalone system row; only its known text is available, with no inferred request options or tool catalog. Prepending its request history replaces that standalone presentation without duplicating the prompt. In-history system prompt changes compare against the most recent request state, including earlier prompt updates without a new request header. Each request retains the prompt and change that applied at its own position. Surface replacements, including compaction, restore the last nonempty surviving system prompt even without a new system event; an unloaded prompt remains unavailable until its page arrives.
 

@@ -345,7 +345,9 @@ export const toolDefinition: ConversationNodeDefinition<ToolState> = {
     const preparing = !('kind' in projected) && projected.phase === 'preparing'
     const visibility = preparing && interruptedAt !== undefined ? 'hidden' : 'visible'
     const location = contextLocation(context)
-    const data = current?.data.root === projected ? current.data : { root: projected } satisfies ToolChatData
+    const data = current?.data.root === projected
+      ? current.data
+      : { root: projected, occurrence: context.occurrence } satisfies ToolChatData
     if (current?.data === data && current.anchorSeq === anchor
       && current.visibility === visibility && current.location === location) return current
     return chatNode(context, 'tool-call', anchor, data, { visibility, location })

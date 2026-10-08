@@ -389,6 +389,7 @@ describe('produced-file Turn data', () => {
       key: 'deliverables:1',
       kind: 'deliverables',
       id: '1',
+      occurrence: 0,
       matches: [startMatch],
       start: startMatch,
       state: undefined,

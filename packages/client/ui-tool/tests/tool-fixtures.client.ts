@@ -25,7 +25,7 @@ export function toolChatSnapshot(
     anchorSeq: 'kind' in root ? root.seq : Number.MAX_SAFE_INTEGER,
     location: { kind: 'session' },
     visibility: 'visible',
-    data: { root },
+    data: { root, occurrence: 0 },
   }))
   const byKey = new Map(nodes.map(node => [node.key, node]))
   const empty: readonly string[] = []

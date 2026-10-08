@@ -444,7 +444,9 @@ function makeHarness(
     usePresentation: bindSnapshotSelector(derivePresentationPolicy(transcriptView)),
     renderSlot,
     SessionProvider: SessionProviderStub,
-    inspectCall: (callId: string) => { openView('trajectory', callId) },
+    inspectCall: (callId: string, occurrence: number) => {
+      openView('trajectory', occurrence === 0 ? callId : `${callId}\u0000${occurrence}`)
+    },
     viewRequest: null,
     openView,
     completeViewRequest: () => {},
@@ -2166,7 +2168,7 @@ describe('ChatView', () => {
       nodes: [toolResult(3, 'a')],
     })
     render(<h.ChatView {...h.props} />)
-    h.toolOwners[0]?.inspectCall?.('a')
+    h.toolOwners[0]?.inspectCall?.('a', 0)
     expect(h.openView).toHaveBeenCalledWith('trajectory', 'a')
   })
 
@@ -3374,7 +3376,7 @@ describe('ChatView', () => {
     expect(owner.openFile).not.toBe(h.openFile)
     owner.openFile('src/a.ts')
     expect(h.openFile).toHaveBeenCalledWith('src/a.ts')
-    owner.inspectCall?.('a')
+    owner.inspectCall?.('a', 0)
     expect(h.openView).toHaveBeenCalledWith('trajectory', 'a')
   })
 

@@ -264,7 +264,7 @@ function settledNode(
     case 'assistant':
       return { ...base, kind: 'assistant-step', data: assistantData(node) }
     case 'tool-result':
-      return { ...base, key: `fixture:tool:${node.callId}`, kind: 'tool-call', data: { root: node } }
+      return { ...base, key: `fixture:tool:${node.callId}`, kind: 'tool-call', data: { root: node, occurrence: 0 } }
     case 'model-retry':
       return { ...base, key: 'fixture:model-retry', kind: 'model-retry', data: { attempts: [node], current: node } }
     default:
@@ -376,7 +376,7 @@ export function chatSnapshotFixture(input: {
       anchorSeq: Number.MAX_SAFE_INTEGER,
       location: turn === undefined ? { kind: 'session' } : { kind: 'turn', turn },
       visibility: 'visible',
-      data: { root: call },
+      data: { root: call, occurrence: 0 },
     })
   }
   for (const [turnNumber, dataStore] of turnData) {

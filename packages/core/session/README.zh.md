@@ -108,7 +108,7 @@ session.deriveMessages()         // the derived model history
 
 ### 共享恢复逻辑
 
-`ToolCallRecovery` 从已提交事件中跟踪尚无结果的请求，不保留事件历史。AgentLoop 观察实时步骤；崩溃恢复与 fork 种子构造通过 `openTurnClosers` 回放各自的前缀。实时失败与崩溃恢复默认使用中断结果文案；fork 构造传入 fork 原因，以选择其专用的重试指引。调用方在关闭步骤之前追加恢复结果（[参考](../agent-loop/README.zh.md)）。
+`ToolCallRecovery` 从已提交事件中跟踪尚无结果的请求，不保留事件历史；它为一个 id 的每个已声明 occurrence 各保留一个待处理条目，而不是每个 id 一个，因此同一 id 被声明两次的步骤会为每个 occurrence 各自写入结果。AgentLoop 观察实时步骤；崩溃恢复与 fork 种子构造通过 `openTurnClosers` 回放各自的前缀。实时失败与崩溃恢复默认使用中断结果文案；fork 构造传入 fork 原因，以选择其专用的重试指引。调用方在关闭步骤之前追加恢复结果（[参考](../agent-loop/README.zh.md)）。
 
 ### 派生历史
 

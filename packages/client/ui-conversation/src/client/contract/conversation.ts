@@ -159,6 +159,14 @@ export interface ConversationNodeContext<State = unknown> {
   readonly key: string
   readonly kind: string
   readonly id: string
+  /**
+   * 0-based position of this Context among the occurrences the assembler
+   * opened for `id`. A Definition whose business id is reused (a provider
+   * re-issuing one tool-call id for parallel calls) yields one Context per
+   * occurrence, so a consumer can address one incarnation instead of always
+   * the first. Occurrence 0 is the Context keyed by the bare id.
+   */
+  readonly occurrence: number
   readonly matches: readonly ConversationMatch[]
   readonly start: ConversationStartMatch | undefined
   readonly state: State | undefined
@@ -326,11 +334,15 @@ export interface ConversationViewBuilder<Node extends ConversationViewNode = Con
 export interface ConversationViewDefinition<Node extends ConversationViewNode = ConversationViewNode, Snapshot = unknown> {
   readonly target: string
   /**
-   * Address a tool call in this target's inspector; absent for non-inspection views.
+   * Address one occurrence of a tool call in this target's inspector; absent
+   * for non-inspection views.
    * @param callId - tool-call identity from the Session.
+   * @param occurrence - 0-based occurrence of that id, naming the incarnation
+   *   the caller addressed. A provider that re-issues one id for parallel calls
+   *   yields several incarnations.
    * @returns the target's opaque focus identity.
    */
-  toolCallFocus?(callId: string): string
+  toolCallFocus?(callId: string, occurrence: number): string
   /** @returns a new Session-owned incremental builder. */
   create(): ConversationViewBuilder<Node, Snapshot>
   /**

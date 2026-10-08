@@ -433,6 +433,8 @@ export interface TrajectoryTableProps {
   onToggleAssistant: (id: string) => void
   /** One-shot cross-view inspect: open and scroll to this call's record. */
   inspectCallId?: string | null
+  /** 0-based occurrence of `inspectCallId` named by the inspect request. */
+  inspectOccurrence?: number
   /** Acknowledge a consumed (or unresolvable) inspect request. */
   onInspectApplied?: (() => void) | undefined
 }
@@ -1157,7 +1159,7 @@ function SourceBlocks({
   t,
 }: {
   blocks: readonly TrajectorySourceBlock[]
-  onOpenCall: (callId: string) => void
+  onOpenCall: (callId: string, occurrence: number) => void
   t: TrajectoryTranslate
 }) {
   const attachments = new Map(recordAttachments(blocks, t).map(entry => [entry.index, entry]))
@@ -1188,7 +1190,7 @@ function SourceBlocks({
                     aria-label={t('block.openSummary', { index: index + 1 })}
                     title={t('block.openSummaryTitle')}
                     onClick={() => {
-                      if (block.callId !== undefined) onOpenCall(block.callId)
+                      if (block.callId !== undefined) onOpenCall(block.callId, block.occurrence ?? 0)
                     }}
                   >
                     <span className={css.sourceBlockLabel}>
@@ -1279,7 +1281,7 @@ function AssistantToolCalls({
 }: {
   blocks: readonly TrajectorySourceBlock[] | undefined
   preview: boolean
-  onOpenCall: (callId: string) => void
+  onOpenCall: (callId: string, occurrence: number) => void
   t: TrajectoryTranslate
 }) {
   const calls = blocks?.filter(block => block.type === 'tool-call') ?? []
@@ -1290,13 +1292,13 @@ function AssistantToolCalls({
       : css.assistantToolCalls}
     >
       {calls.map((call, index) => (
-        <li key={call.callId ?? index}>
+        <li key={`${call.callId ?? 'call'}\u0000${index}`}>
           <button
             type="button"
             className={css.assistantToolCallButton}
             title={t('block.openSummaryTitle')}
             onClick={() => {
-              if (call.callId !== undefined) onOpenCall(call.callId)
+              if (call.callId !== undefined) onOpenCall(call.callId, call.occurrence ?? 0)
             }}
           >
             <svg
@@ -1521,7 +1523,7 @@ function MarkdownRecordContent({
   preview?: boolean
   thinkingExpanded: boolean
   onThinkingExpandedChange: (expanded: boolean) => void
-  onOpenCall: (callId: string) => void
+  onOpenCall: (callId: string, occurrence: number) => void
   renderImages: RenderMessageImages
   t: TrajectoryTranslate
 }) {
@@ -2090,6 +2092,7 @@ export function TrajectoryTable({
   collapsedAssistants,
   onToggleAssistant,
   inspectCallId = null,
+  inspectOccurrence = 0,
   onInspectApplied,
 }: TrajectoryTableProps) {
   const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null)
@@ -2414,25 +2417,37 @@ export function TrajectoryTable({
     activateTab('overview')
   }
 
-  const openCallSummary = (callId: string) => {
-    const target = allRecords.find(record => record.cell.callId === callId)
+  // The Nth tool-call block of an id opens the Nth ledger tool record of that
+  // id, which is the occurrence the layout paired with the matching result.
+  const openCallSummary = (callId: string, occurrence: number) => {
+    let seen = 0
+    const target = allRecords.find((record) => {
+      if (record.cell.kind !== 'tool' || record.cell.callId !== callId) return false
+      return ++seen > occurrence
+    })
     if (target !== undefined) openRecordSummary(target)
   }
 
-  // Cross-view inspect handoff: resolve the requested call to its record,
-  // open its summary, and remember the row to scroll once the un-collapsed
-  // ledger has rendered. Not-found leaves the request pending (`turns` in the
-  // deps retries as history pages in); the ack clears the store field.
+  // Cross-view inspect handoff: resolve the requested call occurrence to its
+  // ledger tool record, open its summary, and remember the row to scroll once
+  // the un-collapsed ledger has rendered. Not-found leaves the request pending
+  // (`turns` in the deps retries as history pages in); the ack clears the store
+  // field. An occurrence beyond the records still advertised (trimmed by a
+  // fork) clamps to the last one.
   const openRecordSummaryRef = useRef(openRecordSummary)
   openRecordSummaryRef.current = openRecordSummary
   useEffect(() => {
     if (inspectCallId === null) return
-    const target = flattenRecords(turns).find(record => record.cell.callId === inspectCallId)
+    let seen = 0
+    const target = flattenRecords(turns).find((record) => {
+      if (record.cell.callId !== inspectCallId) return false
+      return ++seen > inspectOccurrence
+    })
     if (target === undefined) return
     openRecordSummaryRef.current(target)
     pendingScrollRecordId.current = trajectoryRecordId(target.cell)
     onInspectApplied?.()
-  }, [inspectCallId, turns, onInspectApplied])
+  }, [inspectCallId, inspectOccurrence, turns, onInspectApplied])
   useEffect(() => {
     const id = pendingScrollRecordId.current
     if (id === null) return
