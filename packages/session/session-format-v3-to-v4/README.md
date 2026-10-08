@@ -248,7 +248,7 @@ Current common admission does not validate each user/tool/developer content bloc
 | Native `subagent/catalog` | Check own version-0/version-1 payload fields and unique child ids after the inherited cut. Native reads neither collect child logs nor compare their physical facts; inherited entries do not establish own membership. |
 | Inherited cut and delivery | Apply the marker, coordinate, and generation-ownership rules stated above. |
 
-These checks are generation-owned in [relationships.ts](src/relationships.ts). Full common message/envelope acceptance and plugin-owned message projections additionally use the installed Session; the exported V4 restorer alone is not a replacement for complete catalog restoration.
+These checks are generation-owned in [relationships.ts](src/relationships.ts). Full common message/envelope acceptance and plugin-owned message projections additionally use the installed Session; the exported V4 restorer alone is not a replacement for complete catalog restoration. Admission of a repeated advertised tool-call id follows the `SessionFormatRecovery` mode the caller supplies: `strict` refuses it, `recoverable` admits it as another occurrence. `assertReleasedV4Relationships` and `restoreReleasedV4Artifact` default to `strict`, and the installed catalog restores with `recoverable` because released logs written before the adapter disambiguated repeated tool-call ids exist. The persistence scanner passes its own recovery mode, so a normal reload admits those logs and an explicit strict verification still refuses them.
 
 <a id="developer-changes"></a>
 ### Developer changes and deferred schemas

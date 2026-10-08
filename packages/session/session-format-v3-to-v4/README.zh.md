@@ -248,7 +248,7 @@ System image 接纳要求非空 attachment id、PNG／JPEG／WebP／GIF MIME 类
 | 原生 `subagent/catalog` | 检查继承截点之后的自身 version-0/version-1 载荷字段与 child id 唯一性。原生读取既不收集子日志，也不比较其物理事实；继承项不建立自身成员关系。 |
 | 继承截点与 delivery | 应用上文的 marker、坐标及代际归属规则。 |
 
-这些检查由 [relationships.ts](src/relationships.ts) 按代际拥有。完整的通用消息／信封接纳与插件拥有的消息投影还使用已安装 Session；单独的导出 V4 恢复器不能替代完整 catalog 恢复。
+这些检查由 [relationships.ts](src/relationships.ts) 按代际拥有。完整的通用消息／信封接纳与插件拥有的消息投影还使用已安装 Session；单独的导出 V4 恢复器不能替代完整 catalog 恢复。对重复已声明工具调用 id 的接纳遵循调用方传入的 `SessionFormatRecovery` 模式：`strict` 拒绝它，`recoverable` 把它接纳为另一次 occurrence。`assertReleasedV4Relationships` 与 `restoreReleasedV4Artifact` 默认 `strict`，而已安装 catalog 以 `recoverable` 恢复，因为在适配器消歧重复工具调用 id 之前写下的已发布日志确实存在。持久化扫描器传入它自身的 recovery 模式，因此常规重新打开会接纳这些日志，而显式的严格校验仍会拒绝它们。
 
 <a id="developer-changes"></a>
 ### Developer 变更与延迟 schema

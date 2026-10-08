@@ -197,7 +197,7 @@ Config 更新严格验证发生变化的 provider。初始加载将已存储的�
 
 #### 模型看到什么
 
-pi-ai 事件变成 harness 的推理、文本、工具调用、用量与 finish 分片。适配器把解析后的工具参数以原始 JSON 字符串传给 harness。
+pi-ai 事件变成 harness 的推理、文本、工具调用、用量与 finish 分片。适配器把解析后的工具参数以原始 JSON 字符串传给 harness。当提供方在同一条 assistant 消息内多次发出同一个工具调用 id 时，第一次出现保持不变，其后每次出现获得 `#<n>` 后缀，使 harness 能分别寻址每一次调用；提供方收到的仍是它自己发出的 id，而每次被消歧的出现都会连同路由、模型与出现序号一并记录。
 
 #### Token 影响
 
@@ -230,6 +230,7 @@ pi-ai 事件变成 harness 的推理、文本、工具调用、用量与 finish 
 - **提供方 HTTP 状态不可用**——pi-ai 错误事件不跨提供方暴露稳定 HTTP 状态。
 - **重试策略由提供方自有，而非 SDK 重试**——pi-ai SDK 重试保持禁用，因此持久 agent（智能体）步骤与 `llm/retry` 事件拥有每个可见尝试，直接 `ctx.llm.stream()` 调用仍是单次尝试。
 - **流式工具调用参数只在调用结束时解析一次**——安装的 pi-ai 带有 [`patches/@earendil-works__pi-ai@0.87.1.patch`](../../../patches/@earendil-works__pi-ai@0.87.1.patch)，它移除了每个流适配器中对整段累计参数 JSON 的逐 delta 重新解析（上游 [earendil-works/pi#9265](https://github.com/earendil-works/pi/issues/9265)）；未打补丁时，数 MB 的参数流会在事件循环上消耗 O(n²) CPU，并使进程内所有会话停滞。在 `toolcall_end` 之前，pi-ai partial 的工具调用 `arguments` 保持为 `{}`；本适配器只读取 delta 字符串与最终参数。每次升级 pi-ai 时都要重新应用或撤销该补丁。
+- **工具调用 id 消歧始终开启**——在同一条 assistant 消息内重复发出同一个 id 的提供方，其后每次出现都会被加后缀并记录，没有任何配置可以关闭它。为该选择提供 profile 字段是推迟的：当前没有消费者需要它，而一个无人能为其提供理由的默认值并不构成可配置性。
 
 <a id="dev-note"></a>
 ### 开发备注

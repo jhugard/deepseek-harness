@@ -197,7 +197,7 @@ Conversion preserves logical request order, while image handles and offload plac
 
 #### What the model sees
 
-pi-ai events become harness reasoning, text, tool-call, usage, and finish chunks. The adapter passes parsed tool arguments to the harness as raw JSON strings.
+pi-ai events become harness reasoning, text, tool-call, usage, and finish chunks. The adapter passes parsed tool arguments to the harness as raw JSON strings. A tool-call id a provider issues more than once in one assistant message keeps its first occurrence unchanged and gains a `#<n>` suffix on each later occurrence, so the harness addresses each call separately; the provider still receives the id it issued, and each disambiguated occurrence is logged with its route, model, and occurrence number.
 
 #### Token effect
 
@@ -230,6 +230,7 @@ These limits define where the adapter stops and future work begins. They are cur
 - **Provider HTTP status is unavailable** — pi-ai error events do not expose a stable HTTP status across providers.
 - **Retry policy is provider-owned, not an SDK retry** — pi-ai SDK retries stay disabled so durable agent steps and `llm/retry` events own every visible attempt, and direct `ctx.llm.stream()` calls remain single-attempt.
 - **Streamed tool-call arguments are parsed once, when the call ends** — the installed pi-ai carries [`patches/@earendil-works__pi-ai@0.87.1.patch`](../../../patches/@earendil-works__pi-ai@0.87.1.patch), which removes the per-delta re-parse of the whole accumulated argument JSON in every stream adapter (upstream [earendil-works/pi#9265](https://github.com/earendil-works/pi/issues/9265)); unpatched, a multi-megabyte argument stream costs O(n²) CPU on the event loop and stalls every session in the process. Until `toolcall_end`, a pi-ai partial's tool-call `arguments` stays `{}`; this adapter reads only the delta strings and the finalized arguments. Re-apply or retire the patch on every pi-ai upgrade.
+- **Tool-call id disambiguation is always on** — a provider that re-issues one id within one assistant message has each later occurrence suffixed and logged, with no configuration that turns it off. A profile field for that choice is deferred: no current consumer needs one, and a default nobody can justify is not configurability.
 
 <a id="dev-note"></a>
 ### Dev Note

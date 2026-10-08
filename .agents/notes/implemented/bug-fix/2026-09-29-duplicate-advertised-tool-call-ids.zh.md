@@ -36,7 +36,7 @@ Status: implemented
 
 **在实时写入器上加唯一性防护**（`packages/core/session/src/invariant.ts`）。被否决：它把服务器侧的 id 冲突变成一次 turn 内的 agent 失败，其后果比一条记录下来的异常更糟。
 
-**客户端侧的出现路由。** 被否决：让会话装配器每个 id 持有一个 Context 并加上按出现的键、`settle` 与 `dedupe` 的 Definition 钩子、按出现的 Trajectory 行身份、以及感知出现的 Inspect 焦点，这使得每个 Definition 的键控都取决于一种服务器异常；`dedupe` 钩子改变了 compaction pruner 替换项的 Trajectory 行身份；并且与 [docs/subsystems/conversation.md](../../../docs/subsystems/conversation.md) 相矛盾，后者写明每个后续 Match 都调用 `update`。在摄取层给出互不相同的 id 之后，这套机制全部不再必要。
+**客户端侧的出现路由。** 被否决：让会话装配器每个 id 持有一个 Context 并加上按出现的键、`settle` 与 `dedupe` 的 Definition 钩子、按出现的 Trajectory 行身份、以及感知出现的 Inspect 焦点，这使得每个 Definition 的键控都取决于一种服务器异常；`dedupe` 钩子改变了 compaction pruner 替换项的 Trajectory 行身份；并且与 [docs/subsystems/conversation.md](../../../../docs/subsystems/conversation.zh.md) 相矛盾，后者写明每个后续 Match 都调用 `update`。在摄取层给出互不相同的 id 之后，这套机制全部不再必要。
 
 **为所有服务器无条件使 id 唯一**，即把 `output_index` 折进每一个 harness id。被否决：这会改变每一个服务器的 harness id 格式，包括那些从不冲突的服务器。已落地的形式只在冲突确实发生时才追加后缀，因此不冲突的流保持不变。
 
