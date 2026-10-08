@@ -6,50 +6,58 @@ Status: implemented
 
 ## Problem
 
-本地 OpenAI 兼容服务器（例如以 **Responses** API 提供服务的 llama.cpp）在同一次响应的并行工具调用中会输出多个携带**相同 `call_id` 与相同 `id`** 的 output item。pi-ai 的 Responses 适配器把 harness 工具调用 id 组合为 `` `${call_id}|${id}` ``，且仅按 `output_index` 跟踪槽位、不做 id 去重——于是 N 个并行调用组合出 N 个逐字节相同的 harness id，形如 `call_<tok>|fc_<tok>`。六个相互独立的表面都预设了 id 唯一：
+提供 OpenAI **Responses** API 的本地兼容服务器（llama.cpp 以及同类服务器）会为一次响应中的并行调用，用同一个 `call_id` 和同一个条目 `id` 重复发出同一个工具调用。pi-ai 将 harness 的 tool-call id 组合为 `` `${call_id}|${item.id}` ``，并且只按 `output_index` 索引它的输出槽位，因此不同的调用会组合出逐字节相同的 harness id，形如 `call_<tok>|fc_<tok>`。对 22 个已存储会话日志（2,936 条 `assistant/message` 事件）的只读扫描测得：45 组重复 id，每组恰好 2 次出现；没有任何 id 跨 step 或跨 turn 重复；45/45 组共享同一个工具 `name`；没有空 id；没有缺少 `tool/result` 的重复执行；所有受影响的消息都位于 `local` / `openai-responses` 路由——约占 `assistant/message` 事件的 1.2%。
 
-1. v4 重载路径——`SessionLogScanner.finish()` 无条件运行 `assertReleasedV4Relationships`，在第一个重复 id 处硬性拒绝，于是*当前代*会话永久不可读、不可恢复：`SessionFormatError: assistant/message repeats advertised tool call call_<tok>|fc_<tok>`。
-2. 存档迁移——v0→v1、v1→v2 与 v3→v4 的关系游走器携带同一份已发布关系断言，因此任何包含重复 id 的历史日志的迁移都以 `SessionFormatUnsupportedMigrationError` 被拒绝。
-3. Web UI——`ConversationNodeAssembler` 每个 id 只持有一个 Context，于是重复 id 的每个 `tool/call` 与 `tool/result` 匹配都重新挂到那唯一的 Context 上：N 个并行调用及其 N 个结果渲染成一张卡片，用户看到的调用数少于实际执行的调用数。
-4. 恢复写入器——`ToolCallRecovery` 以待处理 map 按 id 为键，因此一个 step 两次广告同一 id 只记录一条待处理条目，`results()` 发射一个合成关闭器，而读取器要求每次出现各一个。中断这样的 step 会写出一份被放宽后的读取器随后拒绝的日志：`SessionFormatError: step/end leaves unresolved tool call call_<tok>|fc_<tok>`。读取器已放宽为出现、写入器仍以 id 为键，就会产出被自身格式闸门拒绝的日志。
-5. Trajectory 账本——`deriveTrajectoryLayout` 以 `callId` 为键索引结果、开始时间与广告 id，而行身份 `trajectoryRecordId` 对携带 `callId` 的单元格解析为 `tool\0call\0<callId>`。于是重复 id 的每次出现都读取同一份结果列表与同一开始时间，且两行携带同一身份，而该身份同时是 React key、`data-trajectory-row-key`、搜索索引键与选择键。在两调用夹具上的实测：两行都显示第二个调用的结果预览、开始时间与时长，渲染出的表格两次记录 `Encountered two children with the same key`——即讨论中报告的重复行与空白行。
-6. 跨视图 Inspect——Chat 卡片的 Inspect 动作以裸 id 寻址目标视图，而 Trajectory 账本用 `find` 解析它，因此点击两条同 id 卡片中第二条的 Inspect 会打开第一次出现的记录。
+重新打开一个已存储的 v4 会话会在 `SessionLogScanner.finish()` 处被拒绝：`SessionFormatError: assistant/message repeats advertised tool call call_<tok>|fc_<tok>`。v0→v1、v1→v2 与 v3→v4 遍历器中的同一断言，会以 `SessionFormatUnsupportedMigrationError` 拒绝任何包含重复 id 的历史日志。一个当前世代的会话因此永久不可读取、不可恢复。
+
+这道防护从未在产生重复的地方运行。`core/session/src/invariant.ts` 只校验打开的 turn 与 step，因此实时写入路径会把带重复 id 的 assistant 消息不加检查地持久化，拒绝只在稍后的读取时出现。其失效方式是可用性，而非正确性。正确性从来不依赖 id 唯一：`executeToolCalls` 为每个模型顺序位置保留一个 `Slot`，并且只提交模型顺序上连续的槽位（`core/agent-loop/src/tool-calls.ts:156`），所以持久化日志按发出顺序而非完成顺序写入；`appendToolResult` 为每个结果标记 `sourceEventSeqs: [callSeq]`（`core/agent-loop/src/tool-calls.ts:289`），即从结果指回它所应答的那条 `tool/call` 事件的直接指针。
 
 ## Decision
 
-把广告 id 当作出现（occurrence）键，而不是唯一身份。
+对未来做规范化，对已存储的做接纳。
 
-在会话格式游走器中，广告工具调用生命周期以**出现列表**跟踪，`tool/call` / `tool/result` 引用按流顺序解析：
+**摄取层。** `toStreamChunks`（`packages/llm/llm-pi-ai/src/stream.ts`）在 `toolcall_start` 处为每个 content index 铸造一次 harness id。一个 id 的第一次出现保持不变；同一 assistant turn 中每次后续出现获得 `#<n>`，其中 `<n>` 是它的 1 基序号。`toolcall_delta` 与最终定稿的 `block-end` 复用这个被跟踪的 id，因此实时增量、持久化块与装配出的 Context 携带同一个身份。每次被消歧的出现都会通过 `PiAiAdapterConfig.onDuplicateToolCallId` 上报，`src/index.ts` 以该路由、模型、服务器发出的原始 id 以及出现序号记录一条警告。异常是被规范化并上报，而不是被吞掉。
 
-- v0→v1 关系在新的 `allowDuplicateAdvertisedToolCall` 扩展下接纳重复广告（裸 v1 保持严格）。该标志是 `RELEASED_V2_RELATIONSHIP_EXTENSIONS` 的一部分，因此已发布的 v2 制品无条件带着它恢复，v1→v2 在已发布 v2 关系扩展中将其硬性启用。
-- v3→v4 关系无条件接纳重复 id（该接缝没有扩展机制）。
+该后缀不会扰乱与服务器之间的往返。Responses 适配器只把第一个 `|` 之前的部分作为 `call_id` 发出，因此服务器收到的仍是它自己发出的 id。Chat Completions 适配器把 assistant 的 tool-call id 与 tool-result 的 id 经由同一个 `normalizeToolCallId` 映射，因此服务器看到的那一对仍然一致。
 
-真正无法区分的用例——同一 id 的重复开始、名称或参数变化、悬空结果——仍被拒绝。
+**读取层。** 每个 id 的广告工具生命周期按出现列表跟踪，`tool/call` 与 `tool/result` 按流顺序解析。
 
-在客户端，assembler 为每个基础键跟踪一个 `OccurrenceRef`，并把每个被接受的 Match 路由到一次出现：第 0 次出现保留裸基础键，因此常见的单出现情形逐字节不变。两个可选的 `ConversationNodeDefinition` 钩子让某个 Definition 在不改变其他 Definition 的前提下 opting in：`settle(match)` 把当前出现标记为终结，使之后同 id 的 Match 开新一次出现；`dedupe(match)` 返回已见过的逐出现身份以丢弃一次再发射（publication `none`）——例如一次 prune 流程重新发送 `message.id` 已被应用的 `tool/result`。chat 与 trajectory 工具 Definition 都注册了这两个钩子。
+- v3→v4 的 `Relationships` 接收该接缝本就携带的 `SessionFormatRecovery` 模式。`strict` 仍以 `assistant/message repeats advertised tool call <id>` 拒绝重复广告；`recoverable` 追加这一次出现。`SessionLogScanner.finish()` 传入扫描器自身的模式，因此常规重新打开会接纳，而显式的严格校验会拒绝。已安装的 catalog 以 `recoverable` 恢复，因为在 id 消歧之前写下的已发布日志确实存在。
+- v0→v1 无条件接纳各次出现，并且移除 `allowDuplicateAdvertisedToolCall` 扩展；v1→v2 不再携带与之相关的已发布关系扩展。该接缝没有可供查询的 recovery 模式，而在此处拒绝会使会话永久无法迁移。
+- `step/end` 与 `turn/end` 仍然拒绝任何未解决的出现。
 
-在恢复写入器中，`ToolCallRecovery` 把每个 id 映射到**按广告顺序排列的出现列表**（`PendingCall` 列表）。`observe()` 为每个广告的 `tool-call` 块压入一条条目；`tool/call` 标记第一条未开始的出现；一次 append 的 `tool/result` 应答其自身 turn 与 step 内第一条已开始的出现，若无则应答第一条未开始的出现，并且只移除那一条。`results()` 为每条剩余出现各发射一个合成结果。单出现 id 的输出与之前逐字节一致：相同的 message id、相同的 `sourceEventSeqs` 存在性、相同的时间戳与序号基准。
+**恢复写入器。** `ToolCallRecovery`（`packages/core/session/src/repair.ts`）把每个 id 映射到它按广告顺序排列的各次出现。`tool/call` 标记第一个尚未开始的出现；一条追加的 `tool/result` 应答其自身 turn 与 step 中第一个已开始的出现，若没有则应答第一个未开始的出现，并且只移除那一次出现。`results()` 为每个剩余出现产出一个合成结果，因此被中断的 step 会关闭它广告过的每一次出现，写入器不再产出自己读取层会拒绝的日志。单次出现的 id 保持原有输出逐字节一致：相同的消息 id、相同的 `sourceEventSeqs` 存在性、相同的时间戳与序号基准。
 
-在 Trajectory 布局中，一个 pass 作用域的 `OccurrencePairing` 分别统计广告块、孤立结果与子派发记录，因此某 id 的第 N 个块按流顺序与该 id 的第 N 个结果配对——与 conversation assembler 施加的配对一致。每个工具单元格显式携带由 `toolRecordId(kind, callId, occurrence)` 产生的 `recordId`，而第 0 次出现解析为 `trajectoryRecordId` 已从裸 `callId` 导出的身份，因此单出现行逐字节保留其身份，后续出现追加 `\0<N>`。`indexResults` 按 id 返回结果列表，`callStartById` 与 `callById` 为每次出现各持一条条目，运行中的调用占位仅出现在超出已持久化广告的出现上。每条 assistant 消息的来源块携带其调用的出现序号，`openCallSummary(callId, occurrence)` 打开该 id 的第 N 条账本工具记录，因此从消息的 Block 列表跳转时落在被点击调用对应的工具行，而不再总是第一条。由于 `appendTrajectoryPartialLayout` 会从头重新推导进行中的 step，`TrajectoryView` 传入已定型布局消耗的计数（`advertisedToolCallCounts`，它排除 partial 自身的 turn 与 step），于是流式调用重新打开已定型布局赋予它的那次出现，而不是开第二次。
-
-对于 Inspect，assembler 在每个 `ConversationNodeContext` 上发布 `occurrence`，chat 的 Tool Definition 把它复制进 `ToolChatData`，`ToolCallTree` 将其传给 `inspectCall(callId, occurrence)`。`ConversationViewDefinition.toolCallFocus(callId, occurrence)` 用 `occurrenceKey` 编码这一对——第 0 次出现就是裸 id，因此此变更之前持久化的 focus 仍可解析——`TrajectoryView` 用 `parseOccurrenceKey` 解码后把两部分交给账本，账本选出该 id 的第 N 条工具记录。一条不再被广告的出现（被 fork 截断）被钳制到仍存在的最后一条记录。
+**仍然拒绝**，在所有界面上：同一 id 的重复 start、被改动的 `name` 或 `arguments`、悬空的结果、数量对不上的情形，以及跨 step 或跨 turn 重复出现的 id。
 
 ## Alternatives considered
 
-**保持拒绝重复、转而修复提供方。** 不采纳：该 id 来自提供方的 wire 格式，且没有任何已发布写入者曾保证守卫所预设的唯一性；已存会话仍不可读，而这类提供方在本地部署中很常见。实测佐证：一份实时日志在 22 个 turn 中携带 201 处重复 id 广告，因此提供方侧的修复无法让任何已存会话变得可读。
+**继续拒绝重复。** 被否决：id 来自服务器的线路格式，没有任何已发布的写入器保证过这些防护所预设的唯一性，而已存储的会话会保持不可读取。这类服务器在本地部署中很常见。
 
-**在恢复时用修复损坏尾部取代修复写入器。** 不采纳：`interruptedTurnClosers` 在这样的日志中找不到可关闭的东西——被中断的 turn 已连同其（数量不足的）关闭器一并提交，失衡位于已持久化前缀内部，而非开放尾部。要让已存储日志可读，需要插入缺失的那次出现的关闭器并对之后每个事件重新编号，这是一个新代次而非一次修复，而相邻迁移规则禁止就地重写已提交的代次。
+**在实时写入器上加唯一性防护**（`packages/core/session/src/invariant.ts`）。被否决：它把服务器侧的 id 冲突变成一次 turn 内的 agent 失败，其后果比一条记录下来的异常更糟。
 
-**在 pi-ai 接缝处让 id 唯一（追加 `output_index`）。** 不采纳：它改变每个提供方的 harness id 格式——存会话、回放查找、wire 词表全都会断——而让单出现情形保留裸 id、逐字节不变，正是第 0 次出现所保持的东西。
+**客户端侧的出现路由。** 被否决：让会话装配器每个 id 持有一个 Context 并加上按出现的键、`settle` 与 `dedupe` 的 Definition 钩子、按出现的 Trajectory 行身份、以及感知出现的 Inspect 焦点，这使得每个 Definition 的键控都取决于一种服务器异常；`dedupe` 钩子改变了 compaction pruner 替换项的 Trajectory 行身份；并且与 [docs/subsystems/conversation.md](../../../docs/subsystems/conversation.md) 相矛盾，后者写明每个后续 Match 都调用 `update`。在摄取层给出互不相同的 id 之后，这套机制全部不再必要。
 
-**让 assembler 以调用/结果对而非 id 作为键。** 不采纳：结果通过 id 引用其调用，所以 id 必须继续作为连接键；修复方式是给键引入多重性（出现），同时保住连接。
+**为所有服务器无条件使 id 唯一**，即把 `output_index` 折进每一个 harness id。被否决：这会改变每一个服务器的 harness id 格式，包括那些从不冲突的服务器。已落地的形式只在冲突确实发生时才追加后缀，因此不冲突的流保持不变。
+
+**修复受影响的日志，或重写一个已提交的世代。** 被否决：相邻迁移可以新增一个以版本号命名的后继，但绝不移动、覆盖或删除已提交的世代，而且不平衡位于一个已提交的 turn 内部，并非位于打开的尾部。今天写下的日志会继续在更大的语料上累积同样的模式。
+
+**为该异常新增一种 Session 事件类型。** 被否决：它会要求格式 catalog、两个 SDK 投影以及快照 fixture 共同承载一条服务器日志本已上报的诊断信息。
+
+**提供一个可关闭消歧的服务器选项。** 是推迟而非落地：当前没有任何消费者需要它，而可配置性并不能为一个缺乏支撑的默认值提供理由。该路由属于服务器 profile 字段，而不是 preset。
 
 ## Consequences
 
-含重复广告 id 的会话可读且可恢复——v4 重载接纳它、历史日志可以迁移——Web UI 把每次出现渲染成各自的卡片，并按流顺序把每个结果与其调用配对，Trajectory 账本为每次出现给出各自的结果、开始时间、时长与行身份，Inspect 打开被点击卡片对应的记录，而一个被中断的 step 会关闭它所广告的每一次出现，于是写入器不再产出被自身读取器拒绝的日志。单出现会话逐字节不变：第 0 次出现保留裸基础键，裸 v1 制品保持严格，单出现的关闭器不变，单出现的 Trajectory 行保留其原有身份，单出现 id 的 Inspect focus 仍是裸调用 id。抓住真实损坏（重复开始、名称或参数变化、悬空结果）的严格性被保留。
+受影响的当前会话可以重新打开，历史日志可以迁移。针对受影响服务器的新会话会为每次调用得到互不相同的 id，并且每次被消歧的出现产生一条警告，写明路由、模型、原始 id 与出现序号。对正确的会话，磁盘上的内容没有任何变化：不冲突的流逐字节相同，第 1 次出现保留裸 id，单次出现的关闭器保持不变。
 
-在写入器修复之前写出的日志无法通过恢复修复：其失衡位于已提交的 turn 内部，接纳它将意味着重写一个已发布代次。这样的会话仍不可读。
+两个读取接缝之间的不对称是有意为之。当前世代的 v4 读取层依据该接缝本就具备的 recovery 模式设卡，因此严格校验保留它的拒绝。历史迁移链无条件接纳各次出现，因为那个接缝没有 recovery 模式，而在那里拒绝会使会话永久无法迁移。
+
+引擎对 id 是无感的：共享一个 id 时，它无法仅凭 id 区分两个结果。让共享 id 的情形保持正确的是日志顺序加上 `sourceEventSeqs` 反向指针，这正是修复方式是一个不同的 id、而不是新的归属逻辑的原因。
+
+在重复 id 的块内部，name 与 arguments 不一致的比例（13.3%）高于其他位置（4.2%）。那是一个独立的服务器与模型批处理问题，此处不予处理。
+
+严格性是需要逐步赢得的。一个重新拒绝重复广告的 v4→v5 世代不在本次范围之内：让本次改动得以读取的既有语料，正是反对在今天继续拒绝的证据。
 
 ## Testing
 
-`packages/session/session-format-v0-to-v1/tests/relationships.spec.ts` 固定扩展门控的接纳：裸 v1 保持严格，扩展 v1 接纳重复广告并按流顺序解析引用，重复开始、参数变化与悬空结果被拒绝。`packages/session/session-format-v1-to-v2/tests/validation.spec.ts` 固定已发布 v2 扩展中的硬性启用。`packages/session/session-format-v3-to-v4/tests/relationships.spec.ts` 固定该接缝处的无条件接纳，其跨边界测试把一次重复广告经由 `ToolCallRecovery` 重放并重新打开两组关闭器：每 id 一个关闭器的集合以 `step/end leaves unresolved tool call` 被拒绝，逐出现的集合被接纳。`packages/client/ui-conversation/tests/conversation-assembler.client.spec.ts` 固定出现拆分：C,R,C,R 与 C,C,R,R 把每个结果与其自身调用配对，prune 再发射被丢弃，逐调用 delta 重新确认存活的出现而不是开新一次。`packages/core/session/tests/repair.spec.ts` 固定写入器：一个 step 内两次广告的 id 关闭两条出现，一条已开始与一条未开始的出现各自取得其错误码，一个结果应答两条中的一条时只有另一条待关闭。`packages/client/ui-trajectory/tests/layout.client.spec.tsx` 固定账本：一条消息在同一 id 下广告两个调用会产生两行，各有自身的工具名、预览、结果预览、开始时间与时长；单出现 id 保留 `trajectoryRecordId` 从裸调用 id 导出的身份；重复 id 的孤立结果成为自身的一条记录而不是被丢弃；`table.client.spec.tsx` 打开两条同 id 调用块中的第二条，并断言被选中的账本行是第二条工具记录。Inspect 接缝在每一跳被固定：`conversation-assembler.client.spec.ts` 在交给 Definition 的 Context 上发布出现序号，`ui-tool/tests/tool-call-tree.client.spec.tsx` 把节点的出现传给 `inspectCall`，`conversation-definitions.client.spec.ts` 把它编码进 focus 键，`table.client.spec.tsx` 打开由出现键指定的 inspect 请求所命名的记录。
+`packages/llm/llm-pi-ai/tests/convert.spec.ts` 固定摄取规则的两半：同一个 id 广告两次会在增量与最终定稿块中产生 `call_dup|fc_dup` 与 `call_dup|fc_dup#2`，并上报一次 `{ id, occurrence: 2 }`；而 id 互不相同的 turn 产出不变的 chunk 且不上报。`packages/session/session-persistence-jsonl/tests/jsonl.spec.ts` 固定重新打开的接缝：同样的存储行在扫描器默认的 `recoverable` 模式下打开，在 `strict` 模式下被拒绝。`packages/session/session-format-v3-to-v4/tests/relationships.spec.ts` 固定 `assertReleasedV4Relationships` 在 `strict` 下拒绝、在 `recoverable` 下接纳，两次出现的流顺序解析，以及为一个广告了同一 id 两次的 step 准备的崩溃恢复关闭器——每个 id 一个关闭器的那一组以 `step/end leaves unresolved tool call` 被拒绝，按出现的那一组被接受。`packages/session/session-format-v0-to-v1/tests/relationships.spec.ts` 固定无条件接纳、`step/end` 处对未解决出现的拒绝，以及保留下来的拒绝：重复 start、被改动的 arguments、悬空的结果。`packages/core/session/tests/repair.spec.ts` 固定写入器：一个 id 在一个 step 内广告两次会关闭两次出现，已开始与未开始的出现各自取得自己的错误码，而一个只应答两者之一的结果只留下另一者待关闭。
