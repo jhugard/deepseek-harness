@@ -63,7 +63,7 @@ sandbox.dispose() // revokes the revocable (temp) grant and label, keeps the sta
 rmSync(tempDir, { recursive: true, force: true })
 ```
 
-工作区的安全描述符改动以常驻方式授予——`dispose()` 保留它们，因为它们是跨实例的复用缓存——而不同的临时 SID 以可回收方式授予。每次授权是两次 `SetNamedSecurityInfoW` 调用：先写入 DACL（能力 SID 允许 ACE + 环境性删除拒绝），再写入 Low 禁止上调标签（持有 `SeRelabelPrivilege` 时直接发出，否则由下文所述的 `WRITE_OWNER` 辅助发出——目录及其子对象上短暂的继承性 `WRITE_OWNER`）——标签位于 SACL，合并的 DACL|LABEL 调用在没有该权限时会整体失败。服务端对应实现是 `AclWriteGrant` 类：每个目录一次 `add(path, standing)`，`dispose()` 撤销可回收路径并释放各 SID。
+工作区的安全描述符改动以常驻方式授予——`dispose()` 保留它们，因为它们是跨实例的复用缓存——而不同的临时 SID 以可回收方式授予。每次授权是两次 `SetNamedSecurityInfoW` 调用：先写入 DACL（能力 SID 允许 ACE + 环境性删除拒绝），再写入 Low 禁止上调标签（持有 `SeRelabelPrivilege` 时直接发出，否则由 `WRITE_OWNER` 辅助承载（见[机制](#understand-the-implementation)）——目录及其子对象上短暂的继承性 `WRITE_OWNER`）——标签位于 SACL，合并的 DACL|LABEL 调用在两者皆无时会整体失败。服务端对应实现是 `AclWriteGrant` 类：每个目录一次 `add(path, standing)`，`dispose()` 撤销可回收路径并释放各 SID。
 
 ### 隔离给你带来什么
 
