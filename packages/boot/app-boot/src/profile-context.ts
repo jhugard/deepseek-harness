@@ -36,22 +36,25 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
-const TELEMETRY_ROW_ID = 'session-telemetry-otel'
+/** Rows that own a network path out of the process; the opt-out switch disables every one present.
+ * The Desktop analytics sender names `productTelemetry` as a required inject, so its uploader row
+ * (`desktop-product-telemetry`) and the sender disable together, as in the bundle patch. */
+const TELEMETRY_ROW_IDS = ['session-telemetry-otel', 'desktop-product-telemetry', 'product-analytics'] as const
 
 /**
- * Resolve the telemetry opt-out switch into its boot patch. ANY non-empty
+ * Resolve the telemetry opt-out switch into its boot patches. ANY non-empty
  * value (including `'0'`/`'false'`) disables: a privacy switch prefers
- * off-by-mistake over on-by-mistake. A composition without the telemetry row
- * exports nothing, so the switch is then trivially satisfied and no patch is
- * generated — custom profiles need not mount telemetry to run with the
- * switch set.
+ * off-by-mistake over on-by-mistake. A composition without a telemetry row
+ * exports nothing through it, so the switch is trivially satisfied for that row
+ * and no patch is generated — custom profiles need not mount telemetry to run
+ * with the switch set.
  * @param disabledEnv - the raw `DSH_TELEMETRY_DISABLED` value (`undefined` when unset).
- * @param hasRow - whether the composition carries the telemetry row.
- * @returns the disable patch, or `undefined` when no hard-disable patch is required.
+ * @param composed - row ids present in the composed composition.
+ * @returns one disable patch per present row, empty when no hard-disable patch is required.
  */
-export function resolveTelemetryPatch(disabledEnv: string | undefined, hasRow: boolean): PatchOptions | undefined {
-  if ((disabledEnv ?? '') === '' || !hasRow) return undefined
-  return { id: TELEMETRY_ROW_ID, disabled: true }
+export function resolveTelemetryPatches(disabledEnv: string | undefined, composed: readonly string[]): PatchOptions[] {
+  if ((disabledEnv ?? '') === '') return []
+  return TELEMETRY_ROW_IDS.filter(id => composed.includes(id)).map(id => ({ id, disabled: true }))
 }
 
 /** Read the selected bundles' patches, which apply before the profile patch file.
@@ -78,8 +81,8 @@ export function readProfilePatches(binName: string, context: ProfileContext, ini
     ...(loadOptionalPatches(binName, join(context.home, PROFILE_PATCH_FILENAME)) ?? []),
     ...context.overlays,
   ])
-  const telemetryPatch = resolveTelemetryPatch(context.telemetryDisabledEnv,
-    composeEntries([patches]).some(row => row.id === TELEMETRY_ROW_ID))
-  if (telemetryPatch !== undefined) patches.push(telemetryPatch)
+  const telemetryPatches = resolveTelemetryPatches(context.telemetryDisabledEnv,
+    composeEntries([patches]).map(row => row.id))
+  patches.push(...telemetryPatches)
   return patches
 }

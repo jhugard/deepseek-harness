@@ -46,11 +46,15 @@
         serviceVersion: !!js process.env.DSH_CLIENT_VERSION
         endpoint: !!js process.env.DSH_PRODUCT_ANALYTICS_OTLP_URL
 
+    # Local patch: collection policy ships off. The `enabled` field is volatile,
+    # so editing this row to `enabled: true` resumes collection without a
+    # rebuild. While false, `report()` returns before any identity lookup, so
+    # the exporter row below never receives an event.
     - id: product-analytics
       name: '@deepseek-ai/dsh-client-product-analytics'
       disabled: !!js "ctx.get('profileContext')?.name !== 'desktop'"
       config:
-        enabled: true
+        enabled: false
         appVersion: !!js process.env.DSH_CLIENT_VERSION
 
     # Host-owned authorization sampled at Agent creation. The Plugins page

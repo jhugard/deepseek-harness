@@ -40,8 +40,12 @@
     - id: session
       name: '@deepseek-ai/dsh-session'
 
+    # Local patch: the contributor mounts but uploads nothing until the user
+    # turns the preference on (Settings → General, or `enabled: true` here).
     - id: session-log-deepseek
       name: '@deepseek-ai/dsh-session-log-deepseek'
+      config:
+        enabled: false
 
     - id: typert
       name: '@deepseek-ai/dsh-typert-registry'
@@ -202,8 +206,16 @@
     - id: otel
       name: '@deepseek-ai/dsh-otel'
 
-    # OTel releases a Session-log prefix only after explicit user feedback,
-    # regardless of model provider. Ordinary activity never triggers capture.
+    # Local patch: the base ships this row in `DISABLED`, so no Session-log
+    # prefix is captured by any profile. Set DSH_TELEMETRY_MODE=FEEDBACK_ONLY
+    # to restore the upstream default (a feedback event then releases the
+    # complete canonical prefix), or point DSH_TELEMETRY_OTLP_URL at your own
+    # collector. Any other mode value, including the rejected `FULL`, fails the
+    # row at load.
+    #
+    # Upstream semantics, kept for when a mode is selected: OTel releases a
+    # Session-log prefix only after explicit user feedback, regardless of model
+    # provider. Ordinary activity never triggers capture.
     # DSH_TELEMETRY_OTLP_URL overrides the production endpoint. A non-empty
     # DSH_TELEMETRY_DISABLED — any value, including '0'/'false' — opts the
     # process out (the launchers patch the row disabled; config cannot disable
@@ -218,7 +230,7 @@
     - id: session-telemetry-otel
       name: '@deepseek-ai/dsh-session-telemetry-otel'
       config:
-        mode: !!js process.env.DSH_TELEMETRY_MODE || 'FEEDBACK_ONLY'
+        mode: !!js process.env.DSH_TELEMETRY_MODE || 'DISABLED'
         shutdownTimeoutMillis: 3000
         maxRequestBytes: 4000000
         exporter:

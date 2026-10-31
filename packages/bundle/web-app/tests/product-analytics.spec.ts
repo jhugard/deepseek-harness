@@ -56,8 +56,10 @@ it.each(['desktop', 'web'])('limits collection and its shutdown to the Desktop l
   const lifetime = new AbortController()
   onTestFinished(() => { lifetime.abort() })
   const policy = analytics.watchPolicy(lifetime.signal)[Symbol.asyncIterator]()
-  expect(await policy.next()).toEqual({ value: true, done: false })
-  for (const enabled of [false, true]) {
+  // Local patch ships `enabled: false`, so the policy starts off and only the
+  // edits below turn collection on.
+  expect(await policy.next()).toEqual({ value: false, done: false })
+  for (const enabled of [true, false, true]) {
     const changed = policy.next()
     await ctx.loader.root.update(entries.map(row => row.id === 'product-analytics'
       ? { ...row, config: { ...row.config as Record<string, unknown>, enabled } } : row))

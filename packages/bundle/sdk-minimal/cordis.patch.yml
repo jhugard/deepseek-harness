@@ -17,8 +17,11 @@
     - id: deepseek-llm-api-extensions
       name: '@deepseek-ai/dsh-deepseek-llm-api-extensions'
 
+    # Local patch: mounts without uploading; see the same row in dsh-base.
     - id: session-log-deepseek
       name: '@deepseek-ai/dsh-session-log-deepseek'
+      config:
+        enabled: false
 
     - id: plugin-package-inventory-deepseek
       name: '@deepseek-ai/dsh-plugin-package-inventory-deepseek'

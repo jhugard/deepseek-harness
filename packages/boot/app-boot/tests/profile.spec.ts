@@ -225,6 +225,32 @@ it('composes current files from profile data and retains launch overlay and tele
   expect(composeEntries([readProfilePatches('test', { ...enabled, overlays: [] })])[0]?.disabled).toBe(false)
 })
 
+it('disables every mounted uploader under the hard-disable switch', () => {
+  const home = tmp()
+  const installAnchor = stageInstallation({
+    base: {
+      patch: [
+        '- insert:',
+        '  - id: desktop-product-telemetry',
+        '    name: telemetry',
+        '  - id: product-analytics',
+        '    name: analytics',
+      ].join('\n'),
+    },
+  })
+  const dir = resolveProfileDir('test', home)
+  initProfile(dir, ['base'])
+  const context = {
+    name: 'test', dir, patchPath: join(dir, 'application.patch.yml'), installAnchor, home, cwd: home,
+    startedBundles: ['base'], overlays: [], telemetryDisabledEnv: '1',
+  }
+  const composed = Object.fromEntries(composeEntries([readProfilePatches('test', context)]).map(row => [row.id, row.disabled]))
+  expect(composed).toEqual({ 'desktop-product-telemetry': true, 'product-analytics': true })
+  // The session uploader is absent here, so the switch generates no patch for it.
+  const off = { ...context, telemetryDisabledEnv: undefined }
+  expect(composeEntries([readProfilePatches('test', off)]).map(row => row.disabled)).toEqual([undefined, undefined])
+})
+
 describe('initProfile', () => {
   it('creates manifest, user patch layer, and pnpm workspace once, never overwriting', () => {
     const home = tmp()
